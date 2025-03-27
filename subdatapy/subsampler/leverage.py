@@ -27,10 +27,10 @@ class LeverageSubSampler(BaseData):
             self.config_ind = np.arange(self.X.shape[0])
             unique_configs = self.config_ind
         else:
-            unique_configs = np.unique(self.config_ind) # need to add here because need to use in calculation of leverage scores
+            unique_configs = np.unique(self.config_ind)
 
         if self.U is None:
-            self.U, self.S, self.Vh = np.linalg.svd(self.X, full_matrices=False)
+            self.U, self.S, self.Vh = np.linalg.svd(self.w.reshape([-1,1])*self.X, full_matrices=False)
         self.leverage_scores = np.sum(self.U**2, axis=1)
         if self.block:
             self.leverage_scores = np.array([np.sum(self.leverage_scores[self.config_ind == unique_config])
