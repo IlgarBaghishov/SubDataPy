@@ -5,37 +5,49 @@ from subdatapy.data import BaseData
 
 class RandomSubSampler(BaseData):
 
-    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_ind=None):
+    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_idxs=None):
 
-        super().__init__(X, compute_lib=compute_lib, y=y, w=w, config_ind=config_ind)
+        super().__init__(X, compute_lib=compute_lib, y=y, w=w, config_idxs=config_idxs)
 
 
     def create_subsample(self, sample_fraction, seed=None):
-
-        np.random.seed(seed)
-        if sample_fraction <= 0 or sample_fraction > 1:
+        
+        self.seed = seed
+        self.sample_fraction = sample_fraction
+        np.random.seed(self.seed)
+        if self.sample_fraction <= 0 or self.sample_fraction > 1:
             raise ValueError("sample_fraction must be between 0 and 1")
 
-        if self.config_ind is None:
-            warnings.warn("config_ind is None. Will remove rows randomly without "
+        self._create_sub_mask()
+        
+        self._subsample()
+
+        return self.sub_mask
+
+
+    def _create_sub_mask(self):
+
+        if self.config_idxs is None:
+            warnings.warn("config_idxs is None. Will remove rows randomly without "
                           "grouping into configurations.", UserWarning)
-            self.config_ind = np.arange(self.X.shape[0])
-            unique_configs = self.config_ind
+            self.config_idxs = np.arange(self.X.shape[0])
+            unique_config_idxs = self.config_idxs
         else:
-            unique_configs = np.unique(self.config_ind)
+            unique_config_idxs = np.unique(self.config_idxs)
 
-        sampled_indices = np.random.choice(unique_configs, size=int(len(unique_configs)*sample_fraction),
-                                           replace=False)
-        mask = sampled_indices if self.config_ind is None else np.isin(self.config_ind, sampled_indices)
+        sub_unique_config_idxs = np.random.choice(unique_config_idxs, 
+                                                  size=int(len(unique_config_idxs)*self.sample_fraction),
+                                                  replace=False)
+        self.sub_mask = sub_unique_config_idxs if self.config_idxs is None else np.isin(self.config_idxs, sub_unique_config_idxs)
 
-        self.config_ind = self.config_ind[mask]
-        self.X_sub = self.X[mask]
+
+    def _subsample(self):
+                
+        self.sub_config_idxs = self.config_idxs[self.sub_mask]
+        self.sub_X = self.X[self.sub_mask]
         if self.y is not None:
-            self.y_sub = self.y[mask]
+            self.sub_y = self.y[self.sub_mask]
         if self.w is not None:
-            self.w_sub = self.w[mask]
-        if self.row_mask is not None:
-            self.row_mask = self.row_mask[mask]
-
-        return self.config_ind
-
+            self.sub_w = self.w[self.sub_mask]
+        if self.enrow_mask is not None:
+            self.sub_enrow_mask = self.enrow_mask[self.sub_mask]

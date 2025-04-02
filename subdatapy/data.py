@@ -24,15 +24,15 @@ def process_data(x, compute_lib):
 
 class BaseData:
 
-    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_ind=None, row_mask=None):
+    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_idxs=None, enrow_mask=None):
         """
         Base class for data handling in SubDataPy.
         :param X: Design Matrix of predictor features (independent variables) X rows are data points and columns are features
         :param compute_lib: Library to use for computation ('numpy' or 'dask')
         :param y: Optional respose feature (dependent variable) y
         :param w: Optional weights vector
-        :param config_ind: Optional configuration index vector
-        :param row_mask: Optional mask for important rows
+        :param config_idxs: Optional configuration index vector
+        :param enrow_mask: Optional mask for energy rows
         """
 
         if compute_lib not in ['numpy', 'dask']:
@@ -42,6 +42,6 @@ class BaseData:
         self.X = process_data(X, compute_lib=self.compute_lib)
         self.y = None if y is None else process_data(y, compute_lib=self.compute_lib)
         self.w = None if w is None else process_data(w, compute_lib=self.compute_lib)
-        self.config_ind = None if config_ind is None else process_data(config_ind, compute_lib=self.compute_lib)
-        self.row_mask = None if row_mask is None else process_data(row_mask, compute_lib=self.compute_lib)
+        self.config_idxs = None if config_idxs is None else process_data(config_idxs, compute_lib=self.compute_lib)
+        self.enrow_mask = None if enrow_mask is None else process_data(enrow_mask, compute_lib=self.compute_lib)
         
