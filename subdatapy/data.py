@@ -24,7 +24,7 @@ def process_data(x, compute_lib):
 
 class BaseData:
 
-    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_idxs=None, enrow_mask=None):
+    def __init__(self, X, y=None, w=None, compute_lib='numpy', config_idxs=None, enrow_mask=None):
         """
         Base class for data handling in SubDataPy.
         :param X: Design Matrix of predictor features (independent variables) X rows are data points and columns are features

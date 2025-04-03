@@ -5,9 +5,9 @@ from subdatapy.data import BaseData
 
 class RandomSubSampler(BaseData):
 
-    def __init__(self, X, compute_lib='numpy', y=None, w=None, config_idxs=None):
+    def __init__(self, X, y=None, w=None, compute_lib='numpy', config_idxs=None):
 
-        super().__init__(X, compute_lib=compute_lib, y=y, w=w, config_idxs=config_idxs)
+        super().__init__(X, y=y, w=w, compute_lib=compute_lib, config_idxs=config_idxs)
 
 
     def create_subsample(self, sample_fraction, seed=None):
@@ -38,7 +38,7 @@ class RandomSubSampler(BaseData):
         sub_unique_config_idxs = np.random.choice(unique_config_idxs, 
                                                   size=int(len(unique_config_idxs)*self.sample_fraction),
                                                   replace=False)
-        self.sub_mask = sub_unique_config_idxs if self.config_idxs is None else np.isin(self.config_idxs, sub_unique_config_idxs)
+        self.sub_mask = np.isin(self.config_idxs, sub_unique_config_idxs)
 
 
     def _subsample(self):
