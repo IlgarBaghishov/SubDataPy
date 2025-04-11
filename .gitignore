@@ -1,2 +1,13 @@
 subdatapy/subsampler/predictor_only
 subdatapy/subsampler/with_response
+examples/distances_in_hypercube_sharp.py
+examples/distances_in_hypercube.py
+examples/distribution_monte_carlo.py
+examples/Be_qSNAP_8/X.npy
+examples/Be_qSNAP_8/y.npy
+examples/Be_qSNAP_8/w.npy
+examples/Be_qSNAP_8/enrow_mask.npy
+examples/Be_qSNAP_8/config_idxs.npy
+tools/generate_matrices/FitSNAP/Be_large_subset_structures.h5
+tools/generate_matrices/FitSNAP/Be_high.hdf
+tools/generate_matrices/FitSNAP/ll_out
