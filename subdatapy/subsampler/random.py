@@ -1,6 +1,8 @@
 import numpy as np
+import pandas as pd
 import warnings
 from subdatapy.data import BaseData
+from collections import defaultdict
 
 
 class RandomSubSampler(BaseData):
@@ -40,7 +42,7 @@ class RandomSubSampler(BaseData):
 
 
     def compute_subsample_errors(self, X_test=None, y_test=None, enrow_mask_test=None):
-        energy_subtrain_rmse, force_subtrain_rmse, energy_nonsubtrain_rmse, force_nonsubtrain_rmse, energy_test_rmse, force_test_rmse = None, None, None, None, None, None
+        force_subtrain_rmse, force_nonsubtrain_rmse, energy_test_rmse, force_test_rmse = None, None, None, None
         self.squared_residuals = np.square(np.dot(self.X,self.sub_coeffs) - self.y.reshape(-1,1))
 
         energy_subtrain_rmse = np.sqrt(np.mean(self.squared_residuals[self.sub_mask*self.enrow_mask]))
@@ -55,13 +57,6 @@ class RandomSubSampler(BaseData):
             force_nonsubtrain_rmse = np.sqrt(np.mean(self.squared_residuals[(~self.sub_mask)*self.train_mask*(~self.enrow_mask)]))
             print("Force training RMSE is", force_nonsubtrain_rmse)
 
-        if self.X_test.shape[0] != 0:
-            energy_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*self.enrow_mask]))
-            print("Energy test RMSE is", energy_test_rmse)
-            if ~np.all(self.enrow_mask):
-                force_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*(~self.enrow_mask)]))
-                print("Force test RMSE is", force_test_rmse)
-
         if X_test is not None and y_test is not None:
             if enrow_mask_test is None: enrow_mask_test = np.full_like(y_test.reshape(-1), True, dtype=bool)
             squared_residuals_test = np.square(np.dot(X_test, self.coeffs) - y_test.reshape(-1,1))
@@ -70,22 +65,85 @@ class RandomSubSampler(BaseData):
             if ~np.all(enrow_mask_test):
                 force_test_rmse = np.sqrt(np.mean(squared_residuals_test[~enrow_mask_test]))
                 print("Force test RMSE is", force_test_rmse)
+        elif self.X_test.shape[0] != 0:
+            energy_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*self.enrow_mask]))
+            print("Energy test RMSE is", energy_test_rmse)
+            if ~np.all(self.enrow_mask):
+                force_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*(~self.enrow_mask)]))
+                print("Force test RMSE is", force_test_rmse)
 
         return energy_subtrain_rmse, force_subtrain_rmse, energy_nonsubtrain_rmse, force_nonsubtrain_rmse, energy_test_rmse, force_test_rmse
 
 
 
-    def create_subsample_errors_sequence(self, list_of_subsample_fractions, seed=None):
+    def create_subsample_errors_sequence(self, subsample_fractions_list, repeat_count_list=1, seed=None):
         
+        if repeat_count_list.isinstance(int):
+            repeat_count_list = [repeat_count_list]*len(subsample_fractions_list)
+        if len(subsample_fractions_list) != len(repeat_count_list):
+            raise ValueError("subsample_fractions_list and repeat_count_list must have same length")
         error_sequence = []
 
-        for subsample_fraction in list_of_subsample_fractions:
-            self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
-            self.train_subsample()
-            error_sequence.append([subsample_fraction,self.compute_subsample_errors()])
+        for i,subsample_fraction in enumerate(subsample_fractions_list):
+            for _ in range(repeat_count_list[i]):
+                self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
+                self.train_subsample()
+                error_sequence.append([subsample_fraction,self.compute_subsample_errors()])
 
         return error_sequence
-            
+
+
+
+    def create_subsample_errors_dataframe(self, subsample_fractions_list, repeat_count_list=1, seed=None):
+
+        if isinstance(repeat_count_list, int):
+            repeat_count_list = [repeat_count_list] * len(subsample_fractions_list)
+        elif len(subsample_fractions_list) != len(repeat_count_list):
+            raise ValueError("subsample_fractions_list and repeat_count_list must have the same length if repeat_count_list is a list")
+
+        error_names = [
+            "Subsampled Training Energy RMSE", "Subsampled Training Force RMSE",
+            "Remaining Training Energy RMSE", "Remaining Training Force RMSE",
+            "Testing Energy RMSE", "Testing Force RMSE"
+        ]
+        collected_errors = defaultdict(list)
+
+        for i, subsample_fraction in enumerate(subsample_fractions_list):
+            num_repeats = repeat_count_list[i]
+            print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
+            for rep in range(num_repeats):
+                # print(f"    Repeat {rep+1}/{num_repeats}...")
+                self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
+                self.train_subsample()
+                computed_errors = self.compute_subsample_errors()
+
+                # Store results, associating each error value with its name and fraction
+                for error_idx, error_value in enumerate(computed_errors):
+                    error_name = error_names[error_idx]
+                    # The key directly maps to the desired column tuple
+                    collected_errors[(error_name, subsample_fraction)].append(error_value)
+
+        errors_df = pd.DataFrame({
+            col_tuple: pd.Series(error_list)
+            for col_tuple, error_list in collected_errors.items()
+        })
+
+        multi_idx = pd.MultiIndex.from_tuples(
+            errors_df.columns,
+            names=['Error Type', 'Subsample Fraction']
+        )
+        error_cat_type = pd.CategoricalDtype(categories=error_names, ordered=True)
+        frac_cat_type = pd.CategoricalDtype(categories=subsample_fractions_list, ordered=True)
+        current_error_levels = multi_idx.levels[0]
+        current_frac_levels = multi_idx.levels[1]
+        new_error_levels = current_error_levels.astype(error_cat_type)
+        new_frac_levels = current_frac_levels.astype(frac_cat_type)
+        multi_idx = multi_idx.set_levels([new_error_levels, new_frac_levels])
+        errors_df.columns = multi_idx
+        errors_df = errors_df.sort_index(axis=1)
+
+        return errors_df
+
 
 
     def _create_sub_mask(self):

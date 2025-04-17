@@ -66,7 +66,7 @@ ACE_settings = \
 "BISPECTRUM":
     {
     "numTypes": 1,
-    "twojmax": 8,
+    "twojmax": 6,
     "rcutfac": 4.812302818,
     "rfac0": 0.99363,
     "rmin0": 0.0,
@@ -76,7 +76,7 @@ ACE_settings = \
     "wselfallflag": 0,
     "chemflag": 0,
     "bzeroflag": 1,
-    "quadraticflag": 1,
+    "quadraticflag": 0,
     },
 "CALCULATOR":
     {
