@@ -1,3 +1,5 @@
+subdatapy/__pycache__
+subdatapy/subsampler/__pycache__
 subdatapy/subsampler/predictor_only
 subdatapy/subsampler/with_response
 examples/distances_in_hypercube_sharp.py

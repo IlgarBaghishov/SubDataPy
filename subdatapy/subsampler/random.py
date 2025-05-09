@@ -7,13 +7,14 @@ from collections import defaultdict
 
 class RandomSubSampler(BaseData):
 
-    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, config_idxs=None, enrow_mask=None, compute_lib='numpy'):
+    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, 
+                 enrow_mask=None, compute_lib='numpy'):
 
         super().__init__(X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask,
                          compute_lib=compute_lib)
 
         self.sub_mask = None
-        self.train_test_split(test_fraction=test_fraction, seed=seed)
+        self.train_test_split(test_fraction=test_fraction, seed=seed, test_mask=test_mask)
 
 
 
@@ -22,7 +23,7 @@ class RandomSubSampler(BaseData):
         self.seed = seed
         np.random.seed(self.seed)
         self.subsample_fraction = subsample_fraction
-        self.n_subsamples = int(len(self.unique_config_idxs_train)*self.subsample_fraction)
+        self.n_subsamples = round(len(self.unique_config_idxs_train)*self.subsample_fraction)
 
         if self.subsample_fraction <= 0 or self.subsample_fraction > 1:
             raise ValueError("sample_fraction must be between 0 and 1")
@@ -49,13 +50,13 @@ class RandomSubSampler(BaseData):
         print("Subsampled data Energy training RMSE is", energy_subtrain_rmse)
         if ~np.all(self.enrow_mask):
             force_subtrain_rmse = np.sqrt(np.mean(self.squared_residuals[self.sub_mask*(~self.enrow_mask)]))
-            print("Force training RMSE is", force_subtrain_rmse)
+            print("Subsampled data Force training RMSE is", force_subtrain_rmse)
 
         energy_nonsubtrain_rmse = np.sqrt(np.mean(self.squared_residuals[(~self.sub_mask)*self.train_mask*self.enrow_mask]))
         print("Remaining data Energy training RMSE is", energy_nonsubtrain_rmse)
         if ~np.all(self.enrow_mask):
             force_nonsubtrain_rmse = np.sqrt(np.mean(self.squared_residuals[(~self.sub_mask)*self.train_mask*(~self.enrow_mask)]))
-            print("Force training RMSE is", force_nonsubtrain_rmse)
+            print("Remaining data Force training RMSE is", force_nonsubtrain_rmse)
 
         if X_test is not None and y_test is not None:
             if enrow_mask_test is None: enrow_mask_test = np.full_like(y_test.reshape(-1), True, dtype=bool)
@@ -78,7 +79,7 @@ class RandomSubSampler(BaseData):
 
     def create_subsample_errors_sequence(self, subsample_fractions_list, repeat_count_list=1, seed=None):
         
-        if repeat_count_list.isinstance(int):
+        if isinstance(repeat_count_list, int):
             repeat_count_list = [repeat_count_list]*len(subsample_fractions_list)
         if len(subsample_fractions_list) != len(repeat_count_list):
             raise ValueError("subsample_fractions_list and repeat_count_list must have same length")

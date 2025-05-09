@@ -6,12 +6,12 @@ from .leverage import LeverageSubSampler
 
 class CookSubSampler(RandomSubSampler):
 
-    def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, config_idxs=None, enrow_mask=None, compute_lib='numpy',
+    def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, enrow_mask=None, compute_lib='numpy',
                  block=False, stepwise=False, sampling=True, ascending=False, initial_subsampler="leverage",
                  initial_subsample_fraction=1, U=None, S=None, Vh=None):
 
-        super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed, config_idxs=config_idxs, enrow_mask=enrow_mask,
-                         compute_lib=compute_lib)
+        super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed, test_mask=test_mask, 
+                         config_idxs=config_idxs, enrow_mask=enrow_mask, compute_lib=compute_lib)
         self.block = block
         self.stepwise = stepwise
         self.sampling = sampling
@@ -31,8 +31,8 @@ class CookSubSampler(RandomSubSampler):
 
     def _create_sub_mask(self):
 
-        self.X_train = self.w_train.reshape([-1,1])*self.X_train
-        self.y_train = self.w_train.reshape([-1,1])*self.y_train.reshape([-1,1])
+        self.X_train = self.w_train.reshape([-1,1]) * self.X_train
+        self.y_train = self.w_train.reshape([-1,1]) * self.y_train.reshape([-1,1])
 
         if self.stepwise:
             self._stepwise_cooks_sampling()
@@ -85,11 +85,13 @@ class CookSubSampler(RandomSubSampler):
             lss = LeverageSubSampler(self.X_train, y=self.y_train, w=self.w_train, compute_lib=self.compute_lib,
                                      config_idxs=self.config_idxs_train, block=self.block)
             self.sub_mask_train = lss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
+            # self.sub_mask_train = np.load("lev_score_mask.npy")
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
 
         elif self.initial_subsampler == "random":
-            rss = RandomSubSampler(self.X, y=self.y, w=self.w, compute_lib=self.compute_lib, config_idxs=self.config_idxs)
-            self.sub_mask_train = rss.create_subsample(sample_fraction=self.initial_subsample_fraction, seed=self.seed)
+            rss = RandomSubSampler(self.X_train, y=self.y_train, w=self.w_train, compute_lib=self.compute_lib,
+                                   config_idxs=self.config_idxs_train)
+            self.sub_mask_train = rss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
 
         
@@ -103,20 +105,21 @@ class CookSubSampler(RandomSubSampler):
         n_subsamples_init = np.sum(self.sub_mask * self.enrow_mask)
 
         if self.S is None and self.Vh is None:
-            self.U, self.S, self.Vh = np.linalg.svd(self.X[self.sub_mask], full_matrices=False)
+            self.U, self.S, self.Vh = np.linalg.svd(self.X_train[self.sub_mask_train], full_matrices=False)
 
         if self.XTX_inv is None: self.XTX_inv = self.Vh.T @ np.diag(np.reciprocal(self.S)**2) @ self.Vh
-        if self.XTy is None: self.XTy = self.X[self.sub_mask].T @ self.y[self.sub_mask]
-        
+        if self.XTy is None: self.XTy = self.X_train[self.sub_mask_train].T @ self.y_train[self.sub_mask_train]
+
         if self.ascending:
             for i in range(n_subsamples_init,self.n_subsamples):
 
                 leverage_scores = self.X_train[self.enrow_mask_train] @ self.XTX_inv
                 leverage_scores = np.einsum('ij,ji->i', leverage_scores, self.X_train[self.enrow_mask_train].T)
                 coeffs = self.XTX_inv @ self.XTy
-                en_residuals_sq = np.square(self.X_train[self.enrow_mask_train] @ coeffs - self.y_train[self.enrow_mask_train].reshape(-1))
-                e_cooks = en_residuals_sq * leverage_scores / (1-leverage_scores)**2
+                en_residuals_sq = np.square(self.X_train[self.enrow_mask_train] @ coeffs - self.y_train[self.enrow_mask_train]).reshape(-1)
+                e_cooks = en_residuals_sq * leverage_scores / (1+leverage_scores)
 
+                e_cooks[self.sub_mask_train[self.enrow_mask_train]] = -np.inf
                 config_to_add = np.argmax(e_cooks)
                 config_to_add_mask = np.isin(self.config_idxs_train, self.unique_config_idxs_train[config_to_add])
                 self.sub_mask_train[config_to_add_mask] = True
@@ -126,16 +129,17 @@ class CookSubSampler(RandomSubSampler):
                 inv_update = np.linalg.inv(np.eye(np.sum(config_to_add_mask)) + self.X_train[config_to_add_mask] @ left_update)
                 right_update = self.X_train[config_to_add_mask] @ self.XTX_inv
                 self.XTX_inv -= left_update @ inv_update @ right_update
-                self.XTy += self.X_train[config_to_add_mask].T @ self.y_train[config_to_add_mask].reshape(-1)
+                self.XTy += self.X_train[config_to_add_mask].T @ self.y_train[config_to_add_mask]
         else:
             for i in range(n_subsamples_init,self.n_subsamples,-1):
                                 
                 leverage_scores = self.X_train[self.enrow_mask_train] @ self.XTX_inv
                 leverage_scores = np.einsum('ij,ji->i', leverage_scores, self.X_train[self.enrow_mask_train].T)
                 coeffs = self.XTX_inv @ self.XTy
-                en_residuals_sq = np.square(self.X_train[self.enrow_mask_train] @ coeffs - self.y_train[self.enrow_mask_train].reshape(-1))
+                en_residuals_sq = np.square(self.X_train[self.enrow_mask_train] @ coeffs - self.y_train[self.enrow_mask_train]).reshape(-1)
                 e_cooks = en_residuals_sq * leverage_scores / (1-leverage_scores)**2
 
+                e_cooks[self.sub_mask_train[self.enrow_mask_train]] = np.inf
                 config_to_remove = np.argmin(e_cooks)
                 config_to_remove_mask = np.isin(self.config_idxs_train, self.unique_config_idxs_train[config_to_remove])
                 self.sub_mask_train[config_to_remove_mask] = False
@@ -145,6 +149,6 @@ class CookSubSampler(RandomSubSampler):
                 inv_update = np.linalg.inv(np.eye(np.sum(config_to_remove_mask)) - self.X_train[config_to_remove_mask] @ left_update)
                 right_update = self.X_train[config_to_remove_mask] @ self.XTX_inv
                 self.XTX_inv += left_update @ inv_update @ right_update
-                self.XTy -= self.X_train[config_to_remove_mask].T @ self.y_train[config_to_remove_mask].reshape(-1)
+                self.XTy -= self.X_train[config_to_remove_mask].T @ self.y_train[config_to_remove_mask]
 
         self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
