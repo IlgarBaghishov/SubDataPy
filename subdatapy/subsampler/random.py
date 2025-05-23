@@ -14,13 +14,14 @@ class RandomSubSampler(BaseData):
                          compute_lib=compute_lib)
 
         self.sub_mask = None
+        self.seed = seed
         self.train_test_split(test_fraction=test_fraction, seed=seed, test_mask=test_mask)
 
 
 
     def create_subsample(self, subsample_fraction, seed=None):
         
-        self.seed = seed
+        self.seed = 42
         np.random.seed(self.seed)
         self.subsample_fraction = subsample_fraction
         self.n_subsamples = round(len(self.unique_config_idxs_train)*self.subsample_fraction)

@@ -21,6 +21,7 @@ class CookSubSampler(RandomSubSampler):
         self.U = U
         self.S = S
         self.Vh = Vh
+        self.seed = seed
 
         self.onestep_en_cooks = None
         self.leverage_scores = None
@@ -45,6 +46,8 @@ class CookSubSampler(RandomSubSampler):
     
 
     def _onestep_cooks_sampling(self):
+
+        np.random.seed(self.seed)
 
         if self.block:
             raise NotImplementedError("Onestep Block Cook's Distance methods are not implemented yet.")
@@ -82,14 +85,14 @@ class CookSubSampler(RandomSubSampler):
             raise ValueError("initial_subsample_fraction must be between 0 and 1")
         
         if self.initial_subsampler == "leverage":
-            lss = LeverageSubSampler(self.X_train, y=self.y_train, w=self.w_train, compute_lib=self.compute_lib,
+            lss = LeverageSubSampler(self.X_train, y=self.y_train, w=self.w_train,seed=self.seed,compute_lib=self.compute_lib,
                                      config_idxs=self.config_idxs_train, block=self.block)
             self.sub_mask_train = lss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
             # self.sub_mask_train = np.load("lev_score_mask.npy")
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
 
         elif self.initial_subsampler == "random":
-            rss = RandomSubSampler(self.X_train, y=self.y_train, w=self.w_train, compute_lib=self.compute_lib,
+            rss = RandomSubSampler(self.X_train, y=self.y_train, w=self.w_train,seed=self.seed, compute_lib=self.compute_lib,
                                    config_idxs=self.config_idxs_train)
             self.sub_mask_train = rss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
@@ -97,6 +100,8 @@ class CookSubSampler(RandomSubSampler):
         
 
     def _stepwise_cooks_sampling(self):
+
+        np.random.seed(self.seed)
         
         if self.block:
             raise NotImplementedError("Stepwise Block Cook's Distance methods are not implemented yet.")
