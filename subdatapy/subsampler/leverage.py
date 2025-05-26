@@ -19,6 +19,8 @@ class LeverageSubSampler(RandomSubSampler):
 
     def _create_sub_mask(self):
 
+        np.random.seed(42)
+
         if self.U is None:
             self.U, self.S, self.Vh = np.linalg.svd(self.w_train.reshape([-1,1])*self.X_train, full_matrices=False)
         self.leverage_scores = np.sum(self.U**2, axis=1)

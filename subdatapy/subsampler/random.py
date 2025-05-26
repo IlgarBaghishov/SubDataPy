@@ -115,7 +115,7 @@ class RandomSubSampler(BaseData):
             print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
             for rep in range(num_repeats):
                 # print(f"    Repeat {rep+1}/{num_repeats}...")
-                self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
+                self.create_subsample(subsample_fraction=subsample_fraction, seed=42)
                 self.train_subsample()
                 computed_errors = self.compute_subsample_errors()
 
@@ -149,7 +149,7 @@ class RandomSubSampler(BaseData):
 
 
     def _create_sub_mask(self):
-
+        np.random.seed(42)
         sub_unique_config_idxs_train = np.random.choice(self.unique_config_idxs_train, size=self.n_subsamples, replace=False)
         self.sub_mask = np.isin(self.config_idxs, sub_unique_config_idxs_train)
         self.sub_mask_train = np.isin(self.config_idxs_train, sub_unique_config_idxs_train)
