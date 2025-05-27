@@ -15,14 +15,15 @@ class RandomSubSampler(BaseData):
 
         self.sub_mask = None
         self.seed = seed
-        self.train_test_split(test_fraction=test_fraction, seed=seed, test_mask=test_mask)
+        self.train_test_split(test_fraction=test_fraction, seed=self.seed, test_mask=test_mask)
 
 
 
     def create_subsample(self, subsample_fraction, seed=None):
         
-        self.seed = 42
-        np.random.seed(self.seed)
+        if seed is not None:
+            self.seed = seed
+            np.random.seed(self.seed)
         self.subsample_fraction = subsample_fraction
         self.n_subsamples = round(len(self.unique_config_idxs_train)*self.subsample_fraction)
 
@@ -149,7 +150,7 @@ class RandomSubSampler(BaseData):
 
 
     def _create_sub_mask(self):
-        np.random.seed(42)
+        
         sub_unique_config_idxs_train = np.random.choice(self.unique_config_idxs_train, size=self.n_subsamples, replace=False)
         self.sub_mask = np.isin(self.config_idxs, sub_unique_config_idxs_train)
         self.sub_mask_train = np.isin(self.config_idxs_train, sub_unique_config_idxs_train)
