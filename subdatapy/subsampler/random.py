@@ -14,14 +14,13 @@ class RandomSubSampler(BaseData):
                          compute_lib=compute_lib)
 
         self.sub_mask = None
-        self.seed = seed
-        self.train_test_split(test_fraction=test_fraction, seed=self.seed, test_mask=test_mask)
+        self.train_test_split(test_fraction=test_fraction, seed=seed, test_mask=test_mask)
 
 
 
     def create_subsample(self, subsample_fraction, seed=None):
         
-        if seed is not None:
+        if seed != self.seed:
             self.seed = seed
             np.random.seed(self.seed)
         self.subsample_fraction = subsample_fraction
@@ -81,12 +80,14 @@ class RandomSubSampler(BaseData):
 
     def create_subsample_errors_sequence(self, subsample_fractions_list, repeat_count_list=1, seed=None):
         
+        if isinstance(subsample_fractions_list, float) or isinstance(subsample_fractions_list, int):
+            subsample_fractions_list = [subsample_fractions_list]
         if isinstance(repeat_count_list, int):
-            repeat_count_list = [repeat_count_list]*len(subsample_fractions_list)
-        if len(subsample_fractions_list) != len(repeat_count_list):
-            raise ValueError("subsample_fractions_list and repeat_count_list must have same length")
+            repeat_count_list = [repeat_count_list] * len(subsample_fractions_list)
+        elif len(subsample_fractions_list) != len(repeat_count_list):
+            raise ValueError("subsample_fractions_list and repeat_count_list must have the same length if repeat_count_list is a list")
+        
         error_sequence = []
-
         for i,subsample_fraction in enumerate(subsample_fractions_list):
             for _ in range(repeat_count_list[i]):
                 self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
@@ -99,6 +100,8 @@ class RandomSubSampler(BaseData):
 
     def create_subsample_errors_dataframe(self, subsample_fractions_list, repeat_count_list=1, seed=None):
 
+        if isinstance(subsample_fractions_list, float) or isinstance(subsample_fractions_list, int):
+            subsample_fractions_list = [subsample_fractions_list]
         if isinstance(repeat_count_list, int):
             repeat_count_list = [repeat_count_list] * len(subsample_fractions_list)
         elif len(subsample_fractions_list) != len(repeat_count_list):
@@ -115,15 +118,12 @@ class RandomSubSampler(BaseData):
             num_repeats = repeat_count_list[i]
             print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
             for rep in range(num_repeats):
-                # print(f"    Repeat {rep+1}/{num_repeats}...")
-                self.create_subsample(subsample_fraction=subsample_fraction, seed=42)
+                self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
                 self.train_subsample()
                 computed_errors = self.compute_subsample_errors()
 
-                # Store results, associating each error value with its name and fraction
                 for error_idx, error_value in enumerate(computed_errors):
                     error_name = error_names[error_idx]
-                    # The key directly maps to the desired column tuple
                     collected_errors[(error_name, subsample_fraction)].append(error_value)
 
         errors_df = pd.DataFrame({
