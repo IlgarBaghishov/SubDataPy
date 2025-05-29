@@ -7,7 +7,7 @@ from .leverage import LeverageSubSampler
 class CookSubSampler(RandomSubSampler):
 
     def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, enrow_mask=None, compute_lib='numpy',
-                 block=False, stepwise=False, sampling=True, ascending=False, initial_subsampler="leverage",
+                 block=False, stepwise=False, sampling=True, ascending=True, initial_subsampler="random",
                  initial_subsample_fraction=1, U=None, S=None, Vh=None):
 
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed, test_mask=test_mask, 
@@ -82,15 +82,14 @@ class CookSubSampler(RandomSubSampler):
             raise ValueError("initial_subsample_fraction must be between 0 and 1")
         
         if self.initial_subsampler == "leverage":
-            lss = LeverageSubSampler(self.X_train, y=self.y_train, seed=self.seed, compute_lib=self.compute_lib,
+            lss = LeverageSubSampler(self.X_train, seed=self.seed, compute_lib=self.compute_lib,
                                      config_idxs=self.config_idxs_train, block=self.block)
-            self.sub_mask_train = lss.create_subsample(subsample_fraction=self.initial_subsample_fraction)
+            self.sub_mask_train = lss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
 
         elif self.initial_subsampler == "random":
-            rss = RandomSubSampler(self.X_train, y=self.y_train, w=self.w_train, seed=self.seed, compute_lib=self.compute_lib,
-                                   config_idxs=self.config_idxs_train)
-            self.sub_mask_train = rss.create_subsample(subsample_fraction=self.initial_subsample_fraction)
+            rss = RandomSubSampler(self.X_train, seed=self.seed, compute_lib=self.compute_lib, config_idxs=self.config_idxs_train)
+            self.sub_mask_train = rss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
             self.sub_mask = np.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train])
 
         
@@ -100,14 +99,13 @@ class CookSubSampler(RandomSubSampler):
         if self.block:
             raise NotImplementedError("Stepwise Block Cook's Distance methods are not implemented yet.")
         
-        if self.sub_mask is None: self._create_initial_sub_mask()
-        n_subsamples_init = np.sum(self.sub_mask * self.enrow_mask)
-
-        if self.S is None and self.Vh is None:
+        if self.sub_mask is None:
+            self._create_initial_sub_mask()
             self.U, self.S, self.Vh = np.linalg.svd(self.X_train[self.sub_mask_train], full_matrices=False)
+            self.XTX_inv = self.Vh.T @ np.diag(np.reciprocal(self.S)**2) @ self.Vh
+            self.XTy = self.X_train[self.sub_mask_train].T @ self.y_train[self.sub_mask_train]
 
-        if self.XTX_inv is None: self.XTX_inv = self.Vh.T @ np.diag(np.reciprocal(self.S)**2) @ self.Vh
-        if self.XTy is None: self.XTy = self.X_train[self.sub_mask_train].T @ self.y_train[self.sub_mask_train]
+        n_subsamples_init = np.sum(self.sub_mask * self.enrow_mask)
 
         if self.ascending:
             for i in range(n_subsamples_init,self.n_subsamples):

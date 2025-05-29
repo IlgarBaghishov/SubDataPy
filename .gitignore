@@ -10,3 +10,52 @@ examples/Be_qSNAP_8/
 tools/generate_matrices/FitSNAP/
 !tools/generate_matrices/FitSNAP/qSNAP.py
 !tools/generate_matrices/FitSNAP/run.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Data files (if large and not meant to be in repo - add specific patterns)
+# *.npy
+# *.h5
+# *.hdf
+
+# Secrets (if any)
+# .secrets/
+# *.env

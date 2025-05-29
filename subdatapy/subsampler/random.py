@@ -43,44 +43,44 @@ class RandomSubSampler(BaseData):
     
 
 
-    def compute_subsample_errors(self, X_test=None, y_test=None, enrow_mask_test=None):
+    def compute_subsample_errors(self, X_test=None, y_test=None, enrow_mask_test=None, verbose=False):
         force_subtrain_rmse, force_nonsubtrain_rmse, energy_test_rmse, force_test_rmse = None, None, None, None
         self.squared_residuals = np.square(np.dot(self.X,self.sub_coeffs) - self.y.reshape(-1,1))
 
         energy_subtrain_rmse = np.sqrt(np.mean(self.squared_residuals[self.sub_mask*self.enrow_mask]))
-        print("Subsampled data Energy training RMSE is", energy_subtrain_rmse)
+        if verbose: print("Subsampled data Energy training RMSE is", energy_subtrain_rmse)
         if ~np.all(self.enrow_mask):
             force_subtrain_rmse = np.sqrt(np.mean(self.squared_residuals[self.sub_mask*(~self.enrow_mask)]))
-            print("Subsampled data Force training RMSE is", force_subtrain_rmse)
+            if verbose: print("Subsampled data Force training RMSE is", force_subtrain_rmse)
 
         energy_nonsubtrain_rmse = np.sqrt(np.mean(self.squared_residuals[(~self.sub_mask)*self.train_mask*self.enrow_mask]))
-        print("Remaining data Energy training RMSE is", energy_nonsubtrain_rmse)
+        if verbose: print("Remaining data Energy training RMSE is", energy_nonsubtrain_rmse)
         if ~np.all(self.enrow_mask):
             force_nonsubtrain_rmse = np.sqrt(np.mean(self.squared_residuals[(~self.sub_mask)*self.train_mask*(~self.enrow_mask)]))
-            print("Remaining data Force training RMSE is", force_nonsubtrain_rmse)
+            if verbose: print("Remaining data Force training RMSE is", force_nonsubtrain_rmse)
 
         if X_test is not None and y_test is not None:
             if enrow_mask_test is None: enrow_mask_test = np.full_like(y_test.reshape(-1), True, dtype=bool)
             squared_residuals_test = np.square(np.dot(X_test, self.coeffs) - y_test.reshape(-1,1))
             energy_test_rmse = np.sqrt(np.mean(squared_residuals_test[enrow_mask_test]))
-            print("Energy test RMSE is", energy_test_rmse)
+            if verbose: print("Energy test RMSE is", energy_test_rmse)
             if ~np.all(enrow_mask_test):
                 force_test_rmse = np.sqrt(np.mean(squared_residuals_test[~enrow_mask_test]))
-                print("Force test RMSE is", force_test_rmse)
+                if verbose: print("Force test RMSE is", force_test_rmse)
         elif self.X_test.shape[0] != 0:
             energy_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*self.enrow_mask]))
-            print("Energy test RMSE is", energy_test_rmse)
+            if verbose: print("Energy test RMSE is", energy_test_rmse)
             if ~np.all(self.enrow_mask):
                 force_test_rmse = np.sqrt(np.mean(self.squared_residuals[self.test_mask*(~self.enrow_mask)]))
-                print("Force test RMSE is", force_test_rmse)
+                if verbose: print("Force test RMSE is", force_test_rmse)
 
         return energy_subtrain_rmse, force_subtrain_rmse, energy_nonsubtrain_rmse, force_nonsubtrain_rmse, energy_test_rmse, force_test_rmse
 
 
 
-    def create_subsample_errors_sequence(self, subsample_fractions_list, repeat_count_list=1, seed=None):
+    def create_subsample_errors_sequence(self, subsample_fractions_list, repeat_count_list=1, seed=None, verbose=False):
         
-        if isinstance(subsample_fractions_list, float) or isinstance(subsample_fractions_list, int):
+        if isinstance(subsample_fractions_list, (float,int)):
             subsample_fractions_list = [subsample_fractions_list]
         if isinstance(repeat_count_list, int):
             repeat_count_list = [repeat_count_list] * len(subsample_fractions_list)
@@ -92,20 +92,25 @@ class RandomSubSampler(BaseData):
             for _ in range(repeat_count_list[i]):
                 self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
                 self.train_subsample()
-                error_sequence.append([subsample_fraction,self.compute_subsample_errors()])
+                error_sequence.append([subsample_fraction,self.compute_subsample_errors(verbose=verbose)])
 
         return error_sequence
 
 
 
-    def create_subsample_errors_dataframe(self, subsample_fractions_list, repeat_count_list=1, seed=None):
+    def create_subsample_errors_dataframe(self, subsample_fractions_list, repeat_count_list=1, seed=None, verbose=False):
 
-        if isinstance(subsample_fractions_list, float) or isinstance(subsample_fractions_list, int):
+        if isinstance(subsample_fractions_list, (float,int)):
             subsample_fractions_list = [subsample_fractions_list]
         if isinstance(repeat_count_list, int):
             repeat_count_list = [repeat_count_list] * len(subsample_fractions_list)
         elif len(subsample_fractions_list) != len(repeat_count_list):
             raise ValueError("subsample_fractions_list and repeat_count_list must have the same length if repeat_count_list is a list")
+        paired_lists = list(zip(repeat_count_list, subsample_fractions_list))
+        sorted_paired_lists = sorted(paired_lists, key=lambda item: item[1])
+        repeat_count_list, subsample_fractions_list = map(list, zip(*sorted_paired_lists))
+        if not all(repeat_count_list[i] >= repeat_count_list[i+1] for i in range(len(repeat_count_list) - 1)):
+            raise ValueError("repeat_count_list must be non-increasing with respect to increasing subsample_fractions_list")
 
         error_names = [
             "Subsampled Training Energy RMSE", "Subsampled Training Force RMSE",
@@ -114,17 +119,22 @@ class RandomSubSampler(BaseData):
         ]
         collected_errors = defaultdict(list)
 
-        for i, subsample_fraction in enumerate(subsample_fractions_list):
-            num_repeats = repeat_count_list[i]
-            print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
-            for rep in range(num_repeats):
-                self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
-                self.train_subsample()
-                computed_errors = self.compute_subsample_errors()
+        repeat_count_old = 0
+        for i, repeat_count in reversed(list(enumerate(repeat_count_list))):
+            for j in range(repeat_count-repeat_count_old):
+                self.sub_mask = None
+                for subsample_fraction in subsample_fractions_list[:i+1]:
 
-                for error_idx, error_value in enumerate(computed_errors):
-                    error_name = error_names[error_idx]
-                    collected_errors[(error_name, subsample_fraction)].append(error_value)
+                    if verbose: print(f"Processing subsample_fraction {subsample_fraction}")
+                    self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
+                    self.train_subsample()
+                    computed_errors = self.compute_subsample_errors(verbose=verbose)
+
+                    for error_idx, error_value in enumerate(computed_errors):
+                        error_name = error_names[error_idx]
+                        collected_errors[(error_name, subsample_fraction)].append(error_value)
+                        
+            repeat_count_old = repeat_count
 
         errors_df = pd.DataFrame({
             col_tuple: pd.Series(error_list)
@@ -146,6 +156,25 @@ class RandomSubSampler(BaseData):
         errors_df = errors_df.sort_index(axis=1)
 
         return errors_df
+            
+
+        # for i, num_repeats in enumerate(repeat_count_list):
+        #     for j in range(num_repeats):
+        #         if verbose: print(f"Processing repeat {j}...")
+        #         subsample_fraction = subsample_fractions_list[i]
+        #         if verbose: print(f"  Processing subsample fraction {subsample_fraction}...")
+
+        # for i, subsample_fraction in enumerate(subsample_fractions_list):
+        #     num_repeats = repeat_count_list[i]
+        #     if verbose: print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
+        #     for rep in range(num_repeats):
+        #         self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
+        #         self.train_subsample()
+        #         computed_errors = self.compute_subsample_errors(verbose=verbose)
+
+        #         for error_idx, error_value in enumerate(computed_errors):
+        #             error_name = error_names[error_idx]
+        #             collected_errors[(error_name, subsample_fraction)].append(error_value)
 
 
 

@@ -45,7 +45,7 @@ class BaseData:
 
         self.X = process_data(X, compute_lib=self.compute_lib)
         self.y = None if y is None else process_data(y, compute_lib=self.compute_lib)
-        self.w = np.ones(self.X.shape) if w is None else process_data(w, compute_lib=self.compute_lib)
+        self.w = np.ones(self.X.shape[0]) if w is None else process_data(w, compute_lib=self.compute_lib)
         if enrow_mask is not None: self.enrow_mask = process_data(enrow_mask, compute_lib=self.compute_lib)
 
         if config_idxs is None:
@@ -65,16 +65,16 @@ class BaseData:
 
     def train_test_split(self, test_fraction=0.0, seed=None, test_mask=None):
 
-        if self.y is None: raise ValueError("y is None. Cannot split data without y.")
+        # if self.y is None: raise ValueError("y is None. Cannot split data without y.")
         self.test_fraction = test_fraction
         self.seed = seed
-        np.random.seed(self.seed)
 
         if test_mask is None:
             if self.test_fraction == 0.0:
                 self.test_mask = np.zeros_like(self.config_idxs, dtype=bool)
                 self.train_mask = np.ones_like(self.config_idxs, dtype=bool)
             elif self.test_fraction > 0.0 and self.test_fraction < 1.0:
+                np.random.seed(self.seed)
                 unique_config_idxs_test = np.random.choice(self.unique_config_idxs,
                                                         size=int(len(self.unique_config_idxs)*self.test_fraction),
                                                         replace=False)
