@@ -1,21 +1,16 @@
 import numpy as np
-import dask.array as da
 import pandas as pd
 import warnings
 
 
 def process_data(x, compute_lib):
-    if isinstance(x, np.ndarray) or isinstance(x, da.Array):
+    if isinstance(x, np.ndarray):
         pass
     elif isinstance(x, pd.DataFrame):
         x = x.values
     elif isinstance(x, str):
         if x.endswith('.npy') and compute_lib == 'numpy':
             x = np.load(x)
-        elif x.endswith('.npy') and compute_lib == 'dask':
-            x = da.from_array(np.load(x))
-        elif x.endswith('.zarr') and compute_lib == 'dask':
-            x = da.from_zarr(x)
         else:
             raise ValueError('File format not supported')
     else:
