@@ -5,11 +5,11 @@ from .random import RandomSubSampler
 
 class LeverageSubSampler(RandomSubSampler):
 
-    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, config_idxs=None, enrow_mask=None, compute_lib='numpy',
-                 block=False, U=None, S=None, Vh=None):
+    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, config_idxs=None, enrow_mask=None, intercept=True,
+                 compute_lib='numpy', block=False, U=None, S=None, Vh=None):
 
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed, config_idxs=config_idxs, enrow_mask=enrow_mask,
-                         compute_lib=compute_lib)
+                         intercept=intercept, compute_lib=compute_lib)
         self.block = block
         self.U = U
         self.S = S

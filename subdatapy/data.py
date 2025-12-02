@@ -21,7 +21,7 @@ def process_data(x, compute_lib):
 
 class BaseData:
 
-    def __init__(self, X, y=None, w=None, config_idxs=None, enrow_mask=None, compute_lib='numpy'):
+    def __init__(self, X, y=None, w=None, config_idxs=None, enrow_mask=None, intercept=True, compute_lib='numpy'):
         """
         Base class for data handling in SubDataPy.
         :param X: Design Matrix of predictor features (independent variables) X rows are data points and columns are features
@@ -39,6 +39,7 @@ class BaseData:
         self.coeffs = None
 
         self.X = process_data(X, compute_lib=self.compute_lib)
+        self.X = np.hstack((np.ones((self.X.shape[0],1)), self.X)) if intercept else self.X
         self.y = None if y is None else process_data(y, compute_lib=self.compute_lib)
         self.w = np.ones(self.X.shape[0]) if w is None else process_data(w, compute_lib=self.compute_lib)
         if enrow_mask is not None: self.enrow_mask = process_data(enrow_mask, compute_lib=self.compute_lib)

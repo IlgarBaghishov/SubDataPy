@@ -6,12 +6,12 @@ from .leverage import LeverageSubSampler
 
 class CookSubSampler(RandomSubSampler):
 
-    def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, enrow_mask=None, compute_lib='numpy',
-                 block=False, stepwise=False, sampling=True, ascending=True, initial_subsampler="random",
+    def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, enrow_mask=None, intercept=True,
+                 compute_lib='numpy', block=False, stepwise=False, sampling=True, ascending=True, initial_subsampler="random",
                  initial_subsample_fraction=1, U=None, S=None, Vh=None):
 
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed, test_mask=test_mask, 
-                         config_idxs=config_idxs, enrow_mask=enrow_mask, compute_lib=compute_lib)
+                         config_idxs=config_idxs, enrow_mask=enrow_mask, intercept=intercept, compute_lib=compute_lib)
         self.block = block
         self.stepwise = stepwise
         self.sampling = sampling

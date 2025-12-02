@@ -8,9 +8,9 @@ from collections import defaultdict
 class RandomSubSampler(BaseData):
 
     def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, 
-                 enrow_mask=None, compute_lib='numpy'):
+                 enrow_mask=None, intercept=True, compute_lib='numpy'):
 
-        super().__init__(X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask,
+        super().__init__(X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask, intercept=intercept,
                          compute_lib=compute_lib)
 
         self.sub_mask = None
