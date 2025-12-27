@@ -9,7 +9,7 @@
     * Leverage Score Subsampling
     * Cook's Distance Subsampling (including iterative/one-step and stepwise approaches)
 * **Configuration Aware:** Supports "block" versions of subsampling methods, considering groups of data rows (e.g., energy and forces for an atomic configuration) as single entities.
-* **Data Handling:** Built on `numpy` and `cupynumeric` for efficient data manipulation.
+* **Data Handling:** Built on `PyTorch` and `cuPyNumeric` for efficient data manipulation.
 
 ## Installation
 
@@ -17,7 +17,7 @@ Currently, SubDataPy is under active development. To install it locally for deve
 
 1.  Clone the repository:
     ```bash
-    git clone [https://github.com/ilgarbaghishov/subdatapy.git](https://github.com/ilgarbaghishov/subdatapy.git) # Replace with your actual repo URL if different
+    git clone https://github.com/IlgarBaghishov/SubDataPy.git
     cd subdatapy
     ```
 2.  Install the package in editable mode with test dependencies:

@@ -8,12 +8,13 @@ name = "SubDataPy"
 version = "0.1.0"
 description = "A Python toolkit for subsampling large datasets for Machine Learning Interatomic Potentials."
 readme = "README.md"
-requires-python = ">=3.8" # Common modern choice
+requires-python = ">=3.11"
 license = { text = "Proprietary" } # Placeholder for your current private status
 authors = [
     { name = "Ilgar Baghishov", email = "baghishov@utexas.edu" },
 ]
 dependencies = [
+    "torch>=2.8",
     "numpy>=1.20",
     "pandas>=1.0",
 ]
@@ -28,7 +29,7 @@ test = [
 # Optional: Links to homepage, repository, etc.
 [project.urls]
 # Homepage = "https://example.com" # Replace if you have one
-Repository = "https://github.com/ilgarbaghishov/subdatapy" # Assuming this is your repo
+Repository = "https://github.com/IlgarBaghishov/SubDataPy"
 
 # Optional: For configuring tools like pytest
 # [tool.pytest.ini_options]
