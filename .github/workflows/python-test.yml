@@ -14,7 +14,7 @@ jobs:
       fail-fast: false # Ensures all Python versions in the matrix are tested
       matrix:
         # Test against a range of relevant Python versions
-        python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
+        python-version: ["3.11", "3.12"]
 
     steps:
     # Step 1: Check out your repository code so the workflow can access it

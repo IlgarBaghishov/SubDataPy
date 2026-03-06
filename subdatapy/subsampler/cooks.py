@@ -198,12 +198,12 @@ class CookSubSampler(RandomSubSampler):
                     
                     # 2. Residuals: X_i @ coeffs - y_i
                     # coeffs: (F, 1)
-                    res = torch.bmm(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1).to('cuda')) - y_batch
+                    res = torch.bmm(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1).to(self.device)) - y_batch
                     
                     # 3. Sherman-Morrison / Cook's Term
                     # For adding: inv(I + H)
                     # For removing: inv(I - H)
-                    identity = torch.eye(max_len, device='cuda').unsqueeze(0)
+                    identity = torch.eye(max_len, device=self.device).unsqueeze(0)
                     
                     if self.ascending:
                         mat_to_inv = identity + fake_lev
@@ -226,7 +226,7 @@ class CookSubSampler(RandomSubSampler):
                     # If ascending, we can't select what's already in sub_mask_train
                     # Check metadata IDs against current mask
                     # This check is fast on GPU
-                    batch_config_ids = batch_meta[:, 0].to('cuda')
+                    batch_config_ids = batch_meta[:, 0].to(self.device)
                     
                     # Construct a boolean vector of "is_in_subset" for this batch
                     # This requires mapping batch_config_ids back to boolean.
@@ -238,7 +238,7 @@ class CookSubSampler(RandomSubSampler):
                     # Use isin
                     # active_ids = self.unique_config_idxs_train[torch.unique(self.config_idxs_train[self.sub_mask_train])]  # this gave error
                     active_ids = torch.unique(self.config_idxs_train[self.sub_mask_train])
-                    is_active = torch.isin(batch_config_ids, active_ids.to('cuda'))
+                    is_active = torch.isin(batch_config_ids, active_ids.to(self.device))
                     
                     if self.ascending:
                         cooks_vals[is_active] = -float('inf')
@@ -261,10 +261,12 @@ class CookSubSampler(RandomSubSampler):
 
                 if self.ascending:
                     e_cooks[self.sub_mask_train[self.enrow_mask_train]] = -float('inf')
-                    best_config_id = torch.argmax(e_cooks)
+                    best_config_idx = torch.argmax(e_cooks)
+                    best_config_id = self.unique_config_idxs_train[best_config_idx]
                 else:
                     e_cooks[self.sub_mask_train[self.enrow_mask_train]] = float('inf')
-                    best_config_id = torch.argmin(e_cooks)
+                    best_config_idx = torch.argmin(e_cooks)
+                    best_config_id = self.unique_config_idxs_train[best_config_idx]
 
             # Apply Update
             config_to_change = best_config_id.item()
@@ -278,8 +280,8 @@ class CookSubSampler(RandomSubSampler):
                 self.sub_mask_train[change_mask] = False
 
             # Update Matrix (Rank-k update)
-            X_change = self.X_train[change_mask].to('cuda')
-            y_change = self.y_train[change_mask].to('cuda')
+            X_change = self.X_train[change_mask].to(self.device)
+            y_change = self.y_train[change_mask].to(self.device)
             
             # Woodbury Identity / Sherman-Morrison for blocks
             # (A +/- UCV)^-1 = A^-1 -/+ A^-1 U (C^-1 +/- V A^-1 U)^-1 V A^-1
@@ -288,7 +290,7 @@ class CookSubSampler(RandomSubSampler):
             left_update = self.XTX_inv @ X_change.T
             
             # Inner inverse size: (k, k) where k is atoms in group
-            inner_term = torch.eye(X_change.shape[0], device='cuda')
+            inner_term = torch.eye(X_change.shape[0], device=self.device)
             inner_right = X_change @ left_update
             
             if self.ascending:

@@ -157,7 +157,7 @@ class TSQRMPICookSubSampler(RandomSubSampler):
         elif self.initial_subsampler == "random":
             
             rss = RandomSubSampler(self.X_train, seed=self.seed, device=self.device,
-                                   config_idxs=self.config_idxs_train)
+                                   config_idxs=self.config_idxs_train, intercept=False)
             self.sub_mask_train = rss.create_subsample(
                 subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
 
@@ -533,7 +533,7 @@ class TSQRMPICookSubSampler(RandomSubSampler):
         best_cooks_val = -float('inf') if self.ascending else float('inf')
         best_config_id = -1
 
-        active_ids = torch.unique(self.config_idxs_train[self.sub_mask_train])
+        active_ids = torch.unique(self.config_idxs_train[self.sub_mask_train]).to(self.device)
         max_len    = self.group_metadata[:, 2].max().item()
         identity   = torch.eye(max_len, device=self.device, dtype=self.dtype)
 
@@ -582,7 +582,7 @@ class TSQRMPICookSubSampler(RandomSubSampler):
                 del fake_lev, res, inv_mat, term_right, term_mid
 
                 # mask already-selected configs
-                batch_config_ids = batch_meta[:, 0]
+                batch_config_ids = batch_meta[:, 0].to(self.device)
                 is_active        = torch.isin(batch_config_ids, active_ids)
 
                 if self.ascending:
@@ -619,7 +619,7 @@ class TSQRMPICookSubSampler(RandomSubSampler):
 
             del X_en, y_en, en_residuals, leverage_scores
 
-            is_active = self.sub_mask_train.cpu()[self.enrow_mask_train.cpu()]
+            is_active = self.sub_mask_train[self.enrow_mask_train].to(self.device)
 
             if self.ascending:
                 e_cooks[is_active] = -float('inf')

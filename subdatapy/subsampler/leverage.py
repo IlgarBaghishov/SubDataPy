@@ -85,5 +85,5 @@ class LeverageSubSampler(RandomSubSampler):
         # so unique_vals[chosen_indices_idx] gives the config IDs
         sub_unique_config_idxs_train = unique_vals[chosen_indices_idx]
         
-        self.sub_mask = torch.isin(self.config_idxs, sub_unique_config_idxs_train)
+        self.sub_mask = torch.isin(self.config_idxs, sub_unique_config_idxs_train.to('cpu'))
         self.sub_mask_train = torch.isin(self.config_idxs_train, sub_unique_config_idxs_train)
