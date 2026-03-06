@@ -94,7 +94,7 @@ mpirun -np <N> python <script.py>
 
 ## CI
 
-GitHub Actions workflow (`.github/workflows/python-test.yml`) runs pytest across Python 3.8-3.12 on ubuntu-latest.
+GitHub Actions workflow (`.github/workflows/python-test.yml`) runs pytest across Python 3.11-3.12 on ubuntu-latest.
 
 ## Style
 
@@ -102,3 +102,12 @@ GitHub Actions workflow (`.github/workflows/python-test.yml`) runs pytest across
 - Uses `torch.float64` (double precision) everywhere for numerical stability
 - Heavy use of PyTorch tensor operations, broadcasting, and GPU acceleration
 - Comments explain mathematical formulas (Woodbury identity, Sherman-Morrison, Cook's distance)
+
+## Watch Out For (past bugs, now fixed — don't reintroduce)
+
+- **`argmax` returns an index, not a config ID.** When selecting configs by score (Cook's, leverage), always map via `unique_config_idxs_train[index]`.
+- **Intercept double-add.** When creating internal subsamplers (e.g. in `_create_initial_sub_mask`), pass `intercept=False` since `X_train` already has the intercept column.
+- **Device consistency.** `config_idxs` and `enrow_mask` live on CPU; `X_train`, `y_train`, `w_train` live on GPU. When mixing in `torch.isin` or boolean indexing, move the smaller tensor to match.
+- **Always use `self.device`**, never hardcode `'cuda'`.
+- **RNG difference.** `torch.manual_seed` + `torch.randperm` gives different sequences than NumPy. Test expected values are tied to PyTorch's RNG — if upgrading PyTorch major versions, expected values may need regeneration.
+- **Conda env:** Use `subdatapy` conda env (Python 3.11) for development and testing.
