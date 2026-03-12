@@ -10,6 +10,7 @@ examples/Be_qSNAP_8/
 tools/generate_matrices/FitSNAP/
 !tools/generate_matrices/FitSNAP/qSNAP.py
 !tools/generate_matrices/FitSNAP/run.sh
+mpi_benchmark/
 
 # Python
 __pycache__/

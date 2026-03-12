@@ -4,6 +4,19 @@ from .random import RandomSubSampler
 from .leverage import LeverageSubSampler
 
 
+def _batched_matmul(A, B):
+    """Batched matrix multiply with loop fallback for CUBLAS compatibility.
+
+    torch.bmm can fail with CUBLAS_STATUS_INVALID_VALUE for float64 on
+    some CUDA toolkit / driver combinations.  When that happens, fall back
+    to a sequential loop which only uses single-batch GEMM calls.
+    """
+    try:
+        return torch.bmm(A, B)
+    except RuntimeError:
+        return torch.stack([A[i] @ B[i] for i in range(A.shape[0])])
+
+
 class CookSubSampler(RandomSubSampler):
 
     def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, enrow_mask=None, intercept=True,
@@ -115,10 +128,12 @@ class CookSubSampler(RandomSubSampler):
 
         if self.initial_subsampler == "leverage":
             lss = LeverageSubSampler(self.X_train, seed=self.seed, device=self.device,
-                                     config_idxs=self.config_idxs_train, block=self.block)
+                                     config_idxs=self.config_idxs_train, block=self.block,
+                                     intercept=False)
             self.sub_mask_train = lss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed).to(device=self.device)
         elif self.initial_subsampler == "random":
-            rss = RandomSubSampler(self.X_train, seed=self.seed, device=self.device, config_idxs=self.config_idxs_train)
+            rss = RandomSubSampler(self.X_train, seed=self.seed, device=self.device,
+                                   config_idxs=self.config_idxs_train, intercept=False)
             self.sub_mask_train = rss.create_subsample(subsample_fraction=self.initial_subsample_fraction, seed=self.seed).to(device=self.device)
 
         self.sub_mask = torch.isin(self.config_idxs, self.config_idxs_train[self.sub_mask_train].to(device='cpu'))
@@ -193,12 +208,12 @@ class CookSubSampler(RandomSubSampler):
                     # 1. Fake Leverage: X_i @ XTX_inv @ X_i.T
                     # X_batch: (B, L, F), XTX_inv: (F, F)
                     # Res: (B, L, L)                    
-                    temp = torch.bmm(X_batch, self.XTX_inv.unsqueeze(0).expand(curr_batch_size, -1, -1))
-                    fake_lev = torch.bmm(temp, X_batch.transpose(1, 2))
+                    temp = _batched_matmul(X_batch, self.XTX_inv.unsqueeze(0).expand(curr_batch_size, -1, -1))
+                    fake_lev = _batched_matmul(temp, X_batch.transpose(1, 2))
                     
                     # 2. Residuals: X_i @ coeffs - y_i
                     # coeffs: (F, 1)
-                    res = torch.bmm(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1).to(self.device)) - y_batch
+                    res = _batched_matmul(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1).to(self.device)) - y_batch
                     
                     # 3. Sherman-Morrison / Cook's Term
                     # For adding: inv(I + H)
@@ -218,9 +233,9 @@ class CookSubSampler(RandomSubSampler):
                     
                     # Final Calc: res.T @ inv_mat @ (fake_lev @ res)
                     # shape: (B, 1, L) @ (B, L, L) @ (B, L, 1) -> (B, 1, 1)
-                    term_right = torch.bmm(fake_lev, res)
-                    term_mid = torch.bmm(inv_mat, term_right)
-                    cooks_vals = torch.bmm(res.transpose(1, 2), term_mid).squeeze()
+                    term_right = _batched_matmul(fake_lev, res)
+                    term_mid = _batched_matmul(inv_mat, term_right)
+                    cooks_vals = _batched_matmul(res.transpose(1, 2), term_mid).squeeze()
                     
                     # Handle already selected masks
                     # If ascending, we can't select what's already in sub_mask_train
@@ -256,7 +271,7 @@ class CookSubSampler(RandomSubSampler):
             else:
                 en_residuals = self.X_train[self.enrow_mask_train] @ coeffs - self.y_train[self.enrow_mask_train]
                 leverage_scores = self.X_train[self.enrow_mask_train] @ self.XTX_inv
-                leverage_scores = torch.einsum('ij,ji->i', leverage_scores, self.X_train[self.enrow_mask_train].T)
+                leverage_scores = torch.sum(leverage_scores * self.X_train[self.enrow_mask_train], dim=1)
                 e_cooks = torch.square(en_residuals).reshape(-1) * leverage_scores / (1+leverage_scores)
 
                 if self.ascending:

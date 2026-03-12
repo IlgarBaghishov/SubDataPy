@@ -137,9 +137,8 @@ class BaseData:
         B = B.reshape(-1, 1)
 
         # 2. Solve
-        # result = torch.linalg.lstsq(A, B)
-        # self.coeffs = result.solution
-        self.coeffs = torch.linalg.pinv(A) @ B
+        result = torch.linalg.lstsq(A, B)
+        self.coeffs = result.solution
         
         # Cleanup
         del A

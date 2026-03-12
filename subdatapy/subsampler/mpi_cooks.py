@@ -2,6 +2,7 @@ import torch
 from mpi4py import MPI
 from contextlib import contextmanager
 from .random import RandomSubSampler
+from .cooks import _batched_matmul
 
 
 @contextmanager
@@ -160,6 +161,9 @@ class TSQRMPICookSubSampler(RandomSubSampler):
                                    config_idxs=self.config_idxs_train, intercept=False)
             self.sub_mask_train = rss.create_subsample(
                 subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
+
+        # Ensure sub_mask_train lives on same device as config_idxs_train
+        self.sub_mask_train = self.sub_mask_train.to(self.config_idxs_train.device)
 
         self.sub_mask = torch.isin(
             self.config_idxs.cpu(), self.config_idxs_train[self.sub_mask_train].cpu())
@@ -560,12 +564,12 @@ class TSQRMPICookSubSampler(RandomSubSampler):
                 del X_batch_cpu, y_batch_cpu
 
                 # 1. Block leverage matrix: H_c = X_c XTX_inv X_c'
-                temp     = torch.bmm(X_batch, self.XTX_inv.unsqueeze(0).expand(curr_batch_size, -1, -1))
-                fake_lev = torch.bmm(temp, X_batch.transpose(1, 2))
+                temp     = _batched_matmul(X_batch, self.XTX_inv.unsqueeze(0).expand(curr_batch_size, -1, -1))
+                fake_lev = _batched_matmul(temp, X_batch.transpose(1, 2))
                 del temp
 
                 # 2. Residuals: r = X_c beta - y_c
-                res = torch.bmm(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1)) - y_batch
+                res = _batched_matmul(X_batch, coeffs.unsqueeze(0).expand(curr_batch_size, -1, -1)) - y_batch
                 del X_batch, y_batch
 
                 # 3. Cook's term: inv(I + H_c) for adding, inv(I - H_c) for removing
@@ -576,9 +580,9 @@ class TSQRMPICookSubSampler(RandomSubSampler):
                 inv_mat = torch.linalg.inv(mat_to_inv)
                 del mat_to_inv
 
-                term_right = torch.bmm(fake_lev, res)
-                term_mid   = torch.bmm(inv_mat, term_right)
-                cooks_vals = torch.bmm(res.transpose(1, 2), term_mid).squeeze(-1).squeeze(-1)
+                term_right = _batched_matmul(fake_lev, res)
+                term_mid   = _batched_matmul(inv_mat, term_right)
+                cooks_vals = _batched_matmul(res.transpose(1, 2), term_mid).squeeze(-1).squeeze(-1)
                 del fake_lev, res, inv_mat, term_right, term_mid
 
                 # mask already-selected configs
