@@ -25,8 +25,8 @@ test = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
 ]
-mpi = [
-    "mpi4py>=3.1",
+distributed = [
+    "torch>=2.8",
 ]
 
 # Optional: Links to homepage, repository, etc.

@@ -6,8 +6,13 @@ from subdatapy.data import BaseData
 
 class RandomSubSampler(BaseData):
 
-    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None, 
-                 enrow_mask=None, intercept=True, device='cuda'):
+    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None,
+                 enrow_mask=None, intercept=True, device='cuda', _train_target_device=None):
+
+        # Allow callers to keep training data on CPU (for chunked/distributed).
+        # Must be set before super().__init__() so train_test_split sees it.
+        if _train_target_device is not None:
+            self._train_target_device = _train_target_device
 
         super().__init__(X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask, intercept=intercept,
                          device=device)
@@ -37,9 +42,11 @@ class RandomSubSampler(BaseData):
     def _create_sub_mask(self):
         perm = torch.randperm(len(self.unique_config_idxs_train), device=self.device)
         chosen_indices = self.unique_config_idxs_train[perm[:self.n_subsamples]]
-        
+
         self.sub_mask = torch.isin(self.config_idxs, chosen_indices.to(device='cpu'))
-        self.sub_mask_train = torch.isin(self.config_idxs_train, chosen_indices)
+        self.sub_mask_train = torch.isin(
+            self.config_idxs_train,
+            chosen_indices.to(self.config_idxs_train.device))
 
 
     def _subsample(self):
@@ -50,23 +57,31 @@ class RandomSubSampler(BaseData):
             self.sub_w_train = self.w[self.sub_mask].to(device=self.device)
 
 
-    def train_subsample(self):
-        # A = self.sub_w_train.reshape(-1, 1) * self.sub_X_train
-        # B = self.sub_w_train.reshape(-1, 1) * self.sub_y_train.reshape(-1, 1)
+    def train_subsample(self, method='lstsq', n_chunks=None):
         A = self.sub_w_train * self.sub_X_train
         B = self.sub_w_train * self.sub_y_train
 
-        result = torch.linalg.lstsq(A, B)
-        self.sub_coeffs = result.solution
+        if method == 'qr':
+            from subdatapy import linalg
+            R, XTy = linalg.tsqr_r_xty(A, B, device=self.device, n_chunks=n_chunks)
+            if R is not None:
+                self.sub_coeffs = linalg.solve_from_r_xty(R, XTy)
+        else:
+            result = torch.linalg.lstsq(A, B)
+            self.sub_coeffs = result.solution
+
+        del A, B
 
 
     def compute_subsample_errors(self, verbose=False):
 
-        train_preds = self.X_train @ self.sub_coeffs
+        # Move coeffs to match X_train device (X_train may be on CPU in chunked mode)
+        train_coeffs = self.sub_coeffs.to(self.X_train.device)
+        train_preds = self.X_train @ train_coeffs
         train_sq_res = torch.square(train_preds - self.y_train)
         test_preds = self.X_test @ self.sub_coeffs
         test_sq_res = torch.square(test_preds - self.y_test)
-        
+
         def get_rmse(sq_res, name):
             val = torch.sqrt(torch.mean(sq_res)).item()
             if verbose: print(f"{name}: {val}")

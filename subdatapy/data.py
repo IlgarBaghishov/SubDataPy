@@ -100,49 +100,53 @@ class BaseData:
             
         self.train_mask = ~self.test_mask
 
-        # IMPORTANT: Only move TRAINING and TESTING sets to GPU
-        self.X_train = self.X[self.train_mask].to(self.device)
-        self.y_train = self.y[self.train_mask].to(self.device) if self.y is not None else None
-        self.w_train = self.w[self.train_mask].to(self.device)
-        self.enrow_mask_train = self.enrow_mask[self.train_mask].to(self.device) if self.enrow_mask is not None else None
+        # Training data target: subsamplers can set _train_target_device='cpu'
+        # before calling super().__init__() to keep large matrices off GPU
+        # (used by chunked/distributed modes where X doesn't fit on one GPU).
+        train_target = getattr(self, '_train_target_device', self.device)
 
+        self.X_train = self.X[self.train_mask].to(train_target)
+        self.y_train = self.y[self.train_mask].to(train_target) if self.y is not None else None
+        self.w_train = self.w[self.train_mask].to(train_target)
+        self.enrow_mask_train = self.enrow_mask[self.train_mask].to(train_target) if self.enrow_mask is not None else None
+        self.config_idxs_train = self.config_idxs[self.train_mask].to(device=train_target)
+
+        # Test data always goes to GPU
         self.X_test = self.X[self.test_mask].to(self.device)
         self.y_test = self.y[self.test_mask].to(self.device) if self.y is not None else None
         self.w_test = self.w[self.test_mask].to(self.device)
         self.enrow_mask_test = self.enrow_mask[self.test_mask].to(self.device) if self.enrow_mask is not None else None
-
-        self.config_idxs_train = self.config_idxs[self.train_mask].to(device=self.device)
         self.config_idxs_test = self.config_idxs[self.test_mask].to(device=self.device)
+
+        # Small per-config tensors always on self.device for sampling operations
         self.unique_config_idxs_train = torch.unique(self.config_idxs_train).to(device=self.device)
         self.unique_config_idxs_test = torch.unique(self.config_idxs_test).to(device=self.device)
 
 
-    def train(self):
-        # Weighted Least Squares on GPU
-        # Solve: (X^T W X) c = X^T W y
-        # Or: min || W^0.5 (X c - y) ||
-        
-        # Apply weights efficiently without blowing up memory
-        # We modify a clone of X_train temporarily
-        
-        # 1. Prepare A and B
-        # NOTE: self.X_train is already on self.device (GPU)
-        
-        # In-place multiplication to save memory
+    def train(self, method='lstsq', n_chunks=None):
+        """Weighted Least Squares training.
+
+        Args:
+            method: 'lstsq' (default, torch.linalg.lstsq) or 'qr' (via TSQR)
+            n_chunks: For 'qr' method, number of chunks. None = auto.
+        """
         A = self.X_train.clone()
-        A.mul_(self.w_train) 
-        
+        A.mul_(self.w_train)
+
         B = self.y_train.clone()
         B.mul_(self.w_train)
         B = B.reshape(-1, 1)
 
-        # 2. Solve
-        result = torch.linalg.lstsq(A, B)
-        self.coeffs = result.solution
-        
-        # Cleanup
-        del A
-        del B
+        if method == 'qr':
+            from . import linalg
+            R, XTy = linalg.tsqr_r_xty(A, B, device=self.device, n_chunks=n_chunks)
+            if R is not None:  # rank 0
+                self.coeffs = linalg.solve_from_r_xty(R, XTy)
+        else:
+            result = torch.linalg.lstsq(A, B)
+            self.coeffs = result.solution
+
+        del A, B
 
 
     def compute_errors(self, verbose=True):
@@ -152,12 +156,13 @@ class BaseData:
         def get_rmse(X_data, y_true, mask, name):
             if X_data.shape[0] == 0: return None
 
-            mask_gpu = mask.to(self.device)
-            if mask_gpu.sum() == 0: return None
+            mask_local = mask.to(X_data.device)
+            if mask_local.sum() == 0: return None
 
-            y_preds = X_data[mask_gpu] @ self.coeffs
-            
-            sq_res = torch.square(y_preds - y_true[mask_gpu])
+            coeffs = self.coeffs.to(X_data.device)
+            y_preds = X_data[mask_local] @ coeffs
+
+            sq_res = torch.square(y_preds - y_true[mask_local])
             rmse = torch.sqrt(torch.mean(sq_res)).item()
             if verbose: print(f"{name} RMSE is {rmse}")
             return rmse

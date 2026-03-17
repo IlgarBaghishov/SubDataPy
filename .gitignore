@@ -11,6 +11,7 @@ tools/generate_matrices/FitSNAP/
 !tools/generate_matrices/FitSNAP/qSNAP.py
 !tools/generate_matrices/FitSNAP/run.sh
 mpi_benchmark/
+paper_latex
 
 # Python
 __pycache__/
