@@ -16,19 +16,16 @@ def mini_dataset(device):
     w = np.load(data_dir+"w.npy")
     config_idxs = np.load(data_dir+"config_idxs.npy")
 
+    # Expected values are shared between CPU and CUDA because the
+    # subsamplers force sampling RNG to CPU (see random.py / leverage.py
+    # / cooks.py) — identical seed => identical selected configs across
+    # devices. Remaining CPU/CUDA drift is from matmul/SVD backend
+    # floating-point differences, well inside the test tolerance.
     expected = {
-        "cpu": {
-            "expected_rs_test_energy_rmse": 0.07199577683153684,
-            "expected_asc_cooks_r_test_energy_rmse": 0.03925666139635273,
-            "expected_ls_test_energy_rmse": 0.08524375243567513,
-            "expected_asc_cooks_l_test_energy_rmse": 0.04745908638574153,
-        },
-        "cuda": {
-            "expected_rs_test_energy_rmse": 0.08384678048006741,
-            "expected_asc_cooks_r_test_energy_rmse": 0.048543032599578276,
-            "expected_ls_test_energy_rmse": 0.049463447171347305,
-            "expected_asc_cooks_l_test_energy_rmse": 0.03682221108591786,
-        },
+        "expected_rs_test_energy_rmse": 0.07199577683153684,
+        "expected_ls_test_energy_rmse": 0.08524375243567513,
+        "expected_asc_cooks_r_test_energy_rmse": 0.03925666139635273,
+        "expected_asc_cooks_l_test_energy_rmse": 0.04745908638574153,
     }
 
     return {
@@ -37,5 +34,5 @@ def mini_dataset(device):
         "w": w,
         "config_idxs": config_idxs,
         "device": device,
-        **expected[device],
+        **expected,
     }

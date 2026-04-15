@@ -129,14 +129,15 @@ Step 2 (reduce):      QR([R_1; R_2; ...; R_k]) -> R_final
 
 X^T y is accumulated per-chunk: `X~^T y~ = sum_i X~_i^T y~_i`, then summed across ranks in distributed mode via `dist.reduce(op=SUM)`.
 
-**4 Execution Modes:**
+**Supported execution modes:**
 
-| `n_chunks` | `world_size` | Mode | Description |
-|:---:|:---:|---|---|
-| None | 1 | Single-pass | Direct `torch.linalg.qr(X~)` |
-| >1 | 1 | Sequential TSQR | Stream chunks through one GPU |
-| None | >1 | Parallel TSQR | 1 chunk per rank, gather + reduce |
-| >1 | >1 | Hybrid TSQR | `n_chunks/world_size` chunks per rank |
+| `n_chunks` | `world_size` | `partitioned` | Description |
+|:---:|:---:|:---:|---|
+| None | 1 | False | Single-pass `torch.linalg.qr(X~)` on one device |
+| >1 or multi-GPU | 1 | False | Chunked / round-robin across `local_devices` |
+| Any | >1 | True | Partitioned TSQR (see §3.4) |
+
+Replicated-distributed mode (world_size>1 with `partitioned=False`) is rejected with `ValueError` — partitioned is strictly more memory-efficient and eliminates the ambiguous `n_chunks` semantics.
 
 **Tree reduction:** After `tree_reduction_threshold` (default 10) R matrices accumulate, they are reduced to bound memory at O(threshold * p^2).
 
@@ -147,6 +148,31 @@ X^T y is accumulated per-chunk: `X~^T y~ = sum_i X~_i^T y~_i`, then summed acros
 Results (R, X^Ty) are returned on rank 0 only; other ranks get `(None, None)`.
 
 **Code:** `linalg.tsqr_r()` (`linalg.py:67`), `linalg.tsqr_r_xty()` (`linalg.py:86`), `linalg._tsqr_core()` (`linalg.py:100`)
+
+### 3.4 Partitioned TSQR (for OOM-free distributed mode)
+
+Replicated distributed TSQR assumes every rank can hold the full X~. For very large matrices this is impossible — so the `partitioned=True` code path splits the rows *at configuration boundaries* during data loading and has each rank compute a local R on its partition only:
+
+```
+Rank r holds X~^(r) = rows belonging to its configs (contiguous, config-aligned)
+           |    Step 1  |                     Step 2
+Rank 0:  X~^(0)  ──QR──> R^(0)  ──┐
+Rank 1:  X~^(1)  ──QR──> R^(1)  ──┤ gather on rank 0
+   ...                             ├──> QR([R^(0); R^(1); ...; R^(W-1)]) ──> R_global
+Rank W-1: X~^(W-1) ──QR──> R^(W-1) ┘
+```
+
+**Correctness:** stacking and QR'ing the local R matrices is mathematically equivalent to QR on the full X~, because
+`[X~^(0); X~^(1); ...] = diag(Q^(0), Q^(1), ...) · [R^(0); R^(1); ...]`
+and the outer QR of the stacked R equals R_global regardless of how the rows were grouped.
+
+**X^Ty:** each rank forms `X~^(r)^T y~^(r)` locally, then `dist.reduce(op=SUM)` combines them.
+
+**Leverage:** after rank 0 computes R_global, it is broadcast back to every rank; each rank computes `h_i = ||R_global^{-T} x_i~||^2` for its local rows, and the per-config aggregates are assembled across ranks via `dist.all_gather_object`.
+
+**NCCL contiguity trap:** `torch.linalg.qr` on CUDA returns R with a column-major stride. Using `torch.empty_like(R)` to allocate the NCCL gather buffer inherits that stride, so NCCL's raw-byte transfer delivers transposed data (only `[0,0]` of each block is populated). The fix is to allocate receive buffers with `torch.empty(R.shape, dtype=..., device=...)` and explicitly call `.contiguous()` on the send buffer.
+
+**Code:** `subdatapy/partition.py` (boundary-aware partitioning + mmap loader), `linalg._tsqr_core()` partitioned branch, `BaseData._load_partitioned()` (`data.py`).
 
 ---
 

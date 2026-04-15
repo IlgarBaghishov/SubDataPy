@@ -20,19 +20,19 @@ subdatapy/
   __init__.py              # Exports BaseData
   data.py                  # BaseData class: data loading, train/test split, WLS training
   linalg.py                # Reusable TSQR + distributed linear algebra (pure functions)
+  partition.py             # Config-boundary partitioning + mmap loader for distributed mode
   subsampler/
-    __init__.py            # Exports: RandomSubSampler, LeverageSubSampler, CookSubSampler, EntropySubSampler
+    __init__.py            # Exports: RandomSubSampler, LeverageSubSampler, CookSubSampler
     random.py              # RandomSubSampler (base for all subsamplers)
     leverage.py            # LeverageSubSampler (SVD or QR-based leverage scores)
     cooks.py               # CookSubSampler (one-step, stepwise, chunked, distributed)
-    entropy.py             # EntropySubSampler (stub/placeholder)
-  trainer/
-    __init__.py            # Empty
 MATH.md                    # Mathematical reference: equations, derivations, code cross-references
 tests/
   conftest.py              # pytest fixtures, loads .npy test data
   test_subsamplers.py      # Tests for Random, Leverage, Cook's subsamplers
   test_linalg.py           # Tests for linalg module (TSQR, inverses, updates, leverage)
+  test_partition.py        # Tests for partition.py utilities
+  test_distributed_regressions.py  # Regressions for the distributed/partitioned code paths
   test_data/               # .npy files (X, y, w, config_idxs)
 tools/
   generate_matrices/FitSNAP/qSNAP.py  # FitSNAP helper to generate descriptor matrices
@@ -40,7 +40,6 @@ examples/
   Be_qSNAP_8/             # Beryllium qSNAP Jupyter notebook
   lithium/                 # Lithium Jupyter notebook
   mpi_benchmark/           # Benchmark script with torchrun support
-docs/                      # RST documentation (stubs)
 ```
 
 ## Class Hierarchy
@@ -61,13 +60,15 @@ All subsamplers inherit from `RandomSubSampler`, which inherits from `BaseData`.
 - **block mode:** Treats all rows of a config as a block for leverage/Cook's calculations.
 - **subsample_fraction:** Fraction of unique configurations to keep.
 - **Data flow:** Data loads to CPU, then moves to GPU (`device='cuda'`) for train/test splits and computation. Uses `torch.float64` throughout.
-- **Distributed data strategy:** On shared filesystems (NERSC), all ranks load the same data independently with identical seeds for identical train/test splits. Only two NCCL collectives needed: `dist.gather` (R matrices) and `dist.reduce` (X'y sum).
+- **Distributed data strategy:** Under `torch.distributed` the only supported mode is **partitioned** — each rank `mmap`-loads only its slice. `BaseData` auto-enters it when given `.npy` *file paths* for both `X` and `config_idxs` under `torchrun`; `partition.py` cuts rows at configuration boundaries (no config is ever split across ranks), and the TSQR gather is done on per-rank local R blocks. Memory scales as `D/world_size` per rank. Passing in-memory tensors under `torchrun` raises `ValueError` — run single-process, or serialize to `.npy` first.
+- **local_devices:** Optional list of CUDA device strings passed to `BaseData` (e.g. `['cuda:0','cuda:1','cuda:2','cuda:3']`) that allows one rank to round-robin TSQR/leverage chunks across multiple local GPUs. Auto-detected via `linalg.get_local_devices()`.
+- **`_is_partitioned`:** Flag on `BaseData` set by auto-detection or by the `partitioned_override=` kwarg. Subsamplers pass `unique_config_idxs_train_override=` to their nested samplers so every rank picks identical configs.
 
 ## linalg.py Module
 
 Reusable pure functions for distributed linear algebra. No mutable state. Mode detection is automatic based on `n_chunks` and `torch.distributed` state.
 
-**TSQR:** `tsqr_r()`, `tsqr_r_xty()` — 4 execution modes: single-pass, sequential TSQR, parallel TSQR, hybrid TSQR. Returns results on rank 0 only (None on other ranks).
+**TSQR:** `tsqr_r()`, `tsqr_r_xty()` — three supported modes: single-pass (single-process, no chunks, single device), chunked single-process (round-robin across `local_devices`), and partitioned multi-rank (each rank QRs its local partition, rank 0 gathers and reduces). Replicated-distributed mode was removed — partitioned is strictly more memory-efficient and has unambiguous parameter semantics.
 
 **Inverses:** `xtx_inv_from_r()` (QR-based, CPU float64 for stability), `xtx_inv_from_svd()` (SVD with singular value filtering).
 
@@ -116,10 +117,10 @@ torchrun --nproc_per_node=4 examples/mpi_benchmark/benchmark.py --method cooks -
 - `RandomSubSampler.train_subsample()` also supports `method='lstsq'` (default) or `method='qr'` with optional `n_chunks`, same pattern as `BaseData.train()`
 - `RandomSubSampler.create_subsample()` is the main entry point — calls `_create_sub_mask()` (overridden by subclasses) then `_subsample()`
 - `create_subsample_errors_dataframe()` runs multiple subsample fractions with repeats, returns a MultiIndex DataFrame. For stepwise Cook's, successive fractions reuse the previous subset (greedy loop continues).
-- Cook's `_create_sub_mask()` applies weights in-place (`mul_`/`div_`) to X_train and y_train around the sampling call
+- Cook's `_create_sub_mask()` applies weights in-place (`mul_`/`div_`) to X_train and y_train around the sampling call, restored inside `try/finally` so an exception never leaves weighted data
 - In chunked/distributed mode, `_move_train_to_cpu()` saves GPU memory; `_move_train_to_device()` restores data for the stepwise loop
 - `_prepare_block_metadata()` sorts rows by config_id, builds group_metadata `[config_id, start_row, count]`, sorts by count for efficient batched padding
-- `_subsample()` is overridden in CookSubSampler to only run on rank 0
+- In distributed partitioned mode, every rank participates in the stepwise greedy loop; owner rank broadcasts the winning config's X/y rows to all ranks via `linalg.broadcast_tensor` so the Woodbury/QR update stays identical on every rank
 
 ## CI
 
@@ -138,5 +139,9 @@ GitHub Actions workflow (`.github/workflows/python-test.yml`) runs pytest across
 - **Intercept double-add.** When creating internal subsamplers (e.g. in `_create_initial_sub_mask`), pass `intercept=False` since `X_train` already has the intercept column.
 - **Device consistency.** `config_idxs` and `enrow_mask` live on CPU; `X_train`, `y_train`, `w_train` live on GPU. When mixing in `torch.isin` or boolean indexing, move the smaller tensor to match. In chunked mode, `_move_train_to_device()` must also move `sub_mask_train`.
 - **Always use `self.device`**, never hardcode `'cuda'`.
-- **RNG difference.** `torch.manual_seed` + `torch.randperm` gives different sequences than NumPy. Test expected values are tied to PyTorch's RNG — if upgrading PyTorch major versions, expected values may need regeneration.
+- **RNG difference — CPU vs CUDA.** `torch.manual_seed` seeds both CPU and CUDA generators as independent streams, so `torch.randperm(n, device='cuda')` and `torch.multinomial(probs_on_cuda, ...)` produce different sequences from their CPU counterparts even with identical seeds. To keep config selection device-independent, all sampling in `random.py`, `leverage.py`, and `cooks.py` (one-step) is **forced onto CPU RNG**: `torch.randperm(n)`, `torch.multinomial(probs.cpu(), ...)`. The selected configs now match across devices; RMSE values still differ by ~1e-12 from matmul/SVD backend floating-point drift, so tests use `pytest.approx(..., rel=1e-6)`. If you add a new sampling step, remember to route its RNG through CPU or the expected-values dict in `conftest.py` will no longer hold on both devices.
+- **NCCL contiguity trap.** `torch.linalg.qr` on CUDA returns a *column-major* R. Using `torch.empty_like(R)` for the NCCL gather buffer inherits that stride, so NCCL's raw-byte transfer arrives transposed (only `[0,0]` populated per block). Always allocate the receive buffer with explicit `torch.empty(R.shape, dtype=..., device=...)` and call `.contiguous()` on the send buffer.
 - **Conda env:** Use `subdatapy` conda env for development and testing.
+- **In-place weighting in Cook's `_create_sub_mask`.** `X_train` and `y_train` are multiplied by `w_train` in place and divided back after sampling. The restore must be inside a `try/finally`; otherwise an exception in the stepwise compute leaves `X_train` permanently weighted.
+- **Partitioned + world_size==1 is rejected.** `tsqr_r(partitioned=True)` with `world_size==1` raises `ValueError`. If you see this, you probably forgot to launch under `torchrun`.
+- **Replicated distributed is rejected.** `tsqr_r(partitioned=False)` with `world_size>1` raises `ValueError`. If you're under `torchrun`, pass `.npy` file paths to `BaseData` so the auto-partition trigger fires.

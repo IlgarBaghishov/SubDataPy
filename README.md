@@ -437,8 +437,10 @@ This keeps only one chunk on GPU at a time, reducing peak memory from O(n*p) to 
 # 4 GPUs on one node
 torchrun --nproc_per_node=4 my_script.py
 
-# Multi-node on NERSC Perlmutter
-srun -N 2 --ntasks-per-node=4 torchrun --nproc_per_node=4 my_script.py
+# Two nodes, one rank per node, each rank using all 4 local GPUs via
+# the `local_devices` parameter (see Partitioned Mode below)
+srun -N 2 --ntasks-per-node=1 --gpus-per-task=4 \
+    torchrun --nnodes=2 --nproc_per_node=1 my_script.py
 ```
 
 ```python
@@ -448,7 +450,9 @@ from subdatapy.subsampler import CookSubSampler
 
 dist.init_process_group(backend='nccl')
 
-# All ranks load the same data (shared filesystem)
+# Under torchrun, SubDataPy requires partitioned mode — pass .npy file
+# paths for X and config_idxs so BaseData auto-enables it. Passing
+# in-memory tensors while distributed raises ValueError.
 cs = CookSubSampler(
     X="data/X.npy", y="data/y.npy", w="data/w.npy",
     config_idxs="data/config_idxs.npy",
@@ -459,27 +463,50 @@ cs = CookSubSampler(
     n_chunks=16,               # 16 total chunks, 4 per GPU
 )
 cs.create_subsample(subsample_fraction=0.5, seed=123)
-
-# Only rank 0 has the result
-if dist.get_rank() == 0:
-    cs.train_subsample()
-    errors = cs.compute_subsample_errors(verbose=True)
+cs.train_subsample()
+errors = cs.compute_subsample_errors(verbose=True)  # all ranks participate
 
 dist.destroy_process_group()
 ```
 
+### Partitioned Mode (OOM-free distributed)
+
+When `BaseData` receives `.npy` file paths for both `X` and `config_idxs` under `torch.distributed`, it *auto-enters* partitioned mode:
+
+1. Rank 0 scans the `config_idxs` file and computes partition boundaries at configuration boundaries (never mid-config) via `partition.compute_partition_ranges`. The ranges are broadcast to all ranks.
+2. Each rank `mmap`-loads only its slice of `X`, `y`, `w`, `config_idxs`, `enrow_mask` — memory is `D/world_size` per rank.
+3. Train/test split uses the global config-id list so every rank agrees on which configs are test. Subsamplers use a global `unique_config_idxs_train` (built via `partition.build_global_config_ids`) so sampling with the same seed yields the same chosen configs across ranks.
+4. TSQR runs in `partitioned=True` mode: each rank QRs its local rows; rank 0 gathers per-rank R matrices and does a final QR; R is broadcast back to all ranks for downstream use. Only small tensors (p×p R, p×1 XTy, and the single winning config's rows per stepwise iteration) travel across NCCL.
+
+```python
+# Target: 2 nodes × 1 rank × 4 local GPUs = 8 GPUs, 2 CPU-RAM partitions.
+# Each rank sees all 4 local GPUs and round-robins chunks across them.
+cs = CookSubSampler(
+    X="data/X.npy", y="data/y.npy", w="data/w.npy",
+    config_idxs="data/config_idxs.npy",
+    enrow_mask="data/enrow_mask.npy",
+    device='cuda:0',
+    local_devices=['cuda:0','cuda:1','cuda:2','cuda:3'],  # round-robin TSQR chunks
+    stepwise=True, ascending=True,
+    factorization='qr',
+)
+```
+
+**`local_devices`** is auto-detected from `torch.cuda.device_count()` if not supplied. When `LOCAL_WORLD_SIZE==1` (one rank per node), it defaults to every visible GPU; when multiple ranks share a node, it defaults to `[device]` and each rank gets one GPU.
+
+**`_is_partitioned`** is the flag set by the auto-detection. You can force it via the `partitioned_override=` kwarg (used internally by `CookSubSampler` to inherit the parent's partition state in nested samplers).
+
+Partitioned mode requires `world_size > 1`. Calling `tsqr_r(partitioned=True)` under a single process raises `ValueError`.
+
 ### TSQR Execution Modes
 
-The factorization mode is automatically selected:
+| `n_chunks` | Setup | Mode | Description |
+|:---:|---|---|---|
+| None | single-process, one `local_devices` | Single-pass | `QR(X)` directly on the device |
+| N | single-process | Chunked | Stream N chunks through the primary device (or round-robin across `local_devices`) |
+| None / per-rank N | partitioned multi-rank (torchrun + file paths) | Partitioned TSQR | Each rank QRs its local partition; rank 0 gathers and reduces across ranks |
 
-| `n_chunks` | GPUs | Mode | Description |
-|:---:|:---:|---|---|
-| None | 1 | Single-pass | `QR(X)` directly on GPU |
-| N | 1 | Sequential TSQR | Stream N chunks through one GPU |
-| None | M | Parallel TSQR | 1 chunk per GPU, gather + reduce |
-| N | M | Hybrid TSQR | N/M chunks per GPU, local reduce, gather, global reduce |
-
-Only two NCCL collectives are needed: `gather` (R matrices) and `reduce` (X'y sum). All communication is GPU-to-GPU.
+Only two NCCL collectives are needed: `gather` (R matrices) and `reduce` (X'y sum). All communication is GPU-to-GPU. Replicated-distributed mode — where every rank holds the full matrix and TSQR merely splits the row range — was removed because partitioned is strictly more memory-efficient.
 
 ### Distributed Leverage Scores
 

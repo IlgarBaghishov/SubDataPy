@@ -1,21 +1,26 @@
 import torch
+import torch.distributed as dist
 import pandas as pd
 from collections import defaultdict
 from subdatapy.data import BaseData
+from subdatapy import linalg
 
 
 class RandomSubSampler(BaseData):
 
     def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None,
-                 enrow_mask=None, intercept=True, device='cuda', _train_target_device=None):
-
-        # Allow callers to keep training data on CPU (for chunked/distributed).
-        # Must be set before super().__init__() so train_test_split sees it.
-        if _train_target_device is not None:
-            self._train_target_device = _train_target_device
-
-        super().__init__(X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask, intercept=intercept,
-                         device=device)
+                 enrow_mask=None, intercept=True, device='cuda',
+                 train_target_device=None,
+                 local_devices=None,
+                 partitioned_override=None,
+                 unique_config_idxs_train_override=None):
+        super().__init__(
+            X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask,
+            intercept=intercept, device=device, local_devices=local_devices,
+            train_target_device=train_target_device,
+            partitioned_override=partitioned_override,
+            unique_config_idxs_train_override=unique_config_idxs_train_override,
+        )
 
         self.sub_mask = None
         self.train_test_split(test_fraction=test_fraction, seed=seed, test_mask=test_mask)
@@ -40,13 +45,17 @@ class RandomSubSampler(BaseData):
 
 
     def _create_sub_mask(self):
-        perm = torch.randperm(len(self.unique_config_idxs_train), device=self.device)
-        chosen_indices = self.unique_config_idxs_train[perm[:self.n_subsamples]]
+        # Sample indices on CPU so CPU and CUDA runs with the same seed pick
+        # the same configs. The CUDA RNG is a separate stream even after
+        # torch.manual_seed, so leaving `device=self.device` here made the
+        # subsampler produce different subsets on each backend.
+        perm = torch.randperm(len(self.unique_config_idxs_train))
+        chosen_indices_cpu = self.unique_config_idxs_train.cpu()[perm[:self.n_subsamples]]
 
-        self.sub_mask = torch.isin(self.config_idxs, chosen_indices.to(device='cpu'))
+        self.sub_mask = torch.isin(self.config_idxs, chosen_indices_cpu)
         self.sub_mask_train = torch.isin(
             self.config_idxs_train,
-            chosen_indices.to(self.config_idxs_train.device))
+            chosen_indices_cpu.to(self.config_idxs_train.device))
 
 
     def _subsample(self):
@@ -60,16 +69,10 @@ class RandomSubSampler(BaseData):
     def train_subsample(self, method='lstsq', n_chunks=None):
         A = self.sub_w_train * self.sub_X_train
         B = self.sub_w_train * self.sub_y_train
-
-        if method == 'qr':
-            from subdatapy import linalg
-            R, XTy = linalg.tsqr_r_xty(A, B, device=self.device, n_chunks=n_chunks)
-            if R is not None:
-                self.sub_coeffs = linalg.solve_from_r_xty(R, XTy)
-        else:
-            result = torch.linalg.lstsq(A, B)
-            self.sub_coeffs = result.solution
-
+        self.sub_coeffs = linalg.solve_wls(
+            A, B, method=method, device=self.device, n_chunks=n_chunks,
+            partitioned=self._is_partitioned, local_devices=self.local_devices,
+            dtype=self.dtype)
         del A, B
 
 
@@ -82,26 +85,31 @@ class RandomSubSampler(BaseData):
         test_preds = self.X_test @ self.sub_coeffs
         test_sq_res = torch.square(test_preds - self.y_test)
 
+        is_rank0 = linalg.get_rank() == 0
+
         def get_rmse(sq_res, name):
-            val = torch.sqrt(torch.mean(sq_res)).item()
-            if verbose: print(f"{name}: {val}")
+            local_sq = float(sq_res.sum().item()) if sq_res.numel() > 0 else 0.0
+            local_n = int(sq_res.numel())
+            val = linalg.distributed_rmse(local_sq, local_n, device=self.device)
+            if val is not None and verbose and is_rank0:
+                print(f"{name}: {val}")
             return val
 
         # Subsampled Train
         mask_sub_en = self.sub_mask_train & self.enrow_mask_train
         e_sub = get_rmse(train_sq_res[mask_sub_en], "Subsampled Training Data Energy RMSE")
-        
+
         mask_sub_f = self.sub_mask_train & (~self.enrow_mask_train)
         f_sub = get_rmse(train_sq_res[mask_sub_f], "Subsampled Training Data Force RMSE")
-        
+
         # Entire Train
         e_train = get_rmse(train_sq_res[self.enrow_mask_train], "Entire Training Data Energy RMSE")
         f_train = get_rmse(train_sq_res[~self.enrow_mask_train], "Entire Training Data Force RMSE")
-        
+
         # Test
         e_test = get_rmse(test_sq_res[self.enrow_mask_test], "Energy Test RMSE")
         f_test = get_rmse(test_sq_res[~self.enrow_mask_test], "Force Test RMSE")
-        
+
         return e_sub, f_sub, e_train, f_train, e_test, f_test
 
 
@@ -163,22 +171,3 @@ class RandomSubSampler(BaseData):
         errors_df = errors_df.sort_index(axis=1)
 
         return errors_df
-            
-
-        # for i, num_repeats in enumerate(repeat_count_list):
-        #     for j in range(num_repeats):
-        #         if verbose: print(f"Processing repeat {j}...")
-        #         subsample_fraction = subsample_fractions_list[i]
-        #         if verbose: print(f"  Processing subsample fraction {subsample_fraction}...")
-
-        # for i, subsample_fraction in enumerate(subsample_fractions_list):
-        #     num_repeats = repeat_count_list[i]
-        #     if verbose: print(f"  Processing fraction {subsample_fraction} ({num_repeats} repeats)...")
-        #     for rep in range(num_repeats):
-        #         self.create_subsample(subsample_fraction=subsample_fraction, seed=seed)
-        #         self.train_subsample()
-        #         computed_errors = self.compute_subsample_errors(verbose=verbose)
-
-        #         for error_idx, error_value in enumerate(computed_errors):
-        #             error_name = error_names[error_idx]
-        #             collected_errors[(error_name, subsample_fraction)].append(error_value)
