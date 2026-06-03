@@ -9,7 +9,7 @@ version = "0.1.0"
 description = "A Python toolkit for subsampling large datasets for Machine Learning Interatomic Potentials."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Proprietary" } # Placeholder for your current private status
+license = { text = "MIT" }
 authors = [
     { name = "Ilgar Baghishov", email = "baghishov@utexas.edu" },
 ]
@@ -24,9 +24,6 @@ dependencies = [
 test = [
     "pytest>=6.0",
     "pytest-cov>=2.0",
-]
-distributed = [
-    "torch>=2.8",
 ]
 
 # Optional: Links to homepage, repository, etc.
