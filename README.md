@@ -47,14 +47,19 @@ Subsampling has been shown to not only increase training speed by reducing datas
 ## Installation
 
 ```bash
+pip install subdatapy
+```
+
+> **Note on PyTorch:** `pip install subdatapy` pulls the default PyTorch wheel from PyPI — a CPU build on macOS/Windows, and the CUDA-enabled build on Linux x86_64. On some machines (e.g. if you need a specific CUDA or ROCm version), you may have to install PyTorch **first**, following the [official instructions](https://pytorch.org/get-started/locally/), and then run `pip install subdatapy`.
+
+For development (tests and coverage):
+
+```bash
 git clone https://github.com/IlgarBaghishov/SubDataPy.git
 cd SubDataPy
 
-# Install with test dependencies
+# Install in editable mode with test dependencies
 pip install -e ".[test]"
-
-# Install runtime only
-pip install -e .
 ```
 
 ### Requirements

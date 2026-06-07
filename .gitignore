@@ -23,6 +23,10 @@ build/
 dist/
 *.egg-info/
 *.so
+
+# Tooling / agent sessions
+.playwright-mcp/
+.claude/
 *.pyd
 
 # Virtual environments
