@@ -210,11 +210,11 @@ def build_global_config_ids(local_config_ids: torch.Tensor) -> torch.Tensor:
     Returns:
         Sorted 1D tensor of all unique config IDs across all ranks (CPU).
     """
-    local_ids = local_config_ids.cpu().tolist()
-    all_ids = [None] * dist.get_world_size()
-    dist.all_gather_object(all_ids, local_ids)
-
-    global_ids = []
-    for ids in all_ids:
-        global_ids.extend(ids)
-    return torch.tensor(sorted(set(global_ids)), dtype=local_config_ids.dtype, device='cpu')
+    # Gather the per-rank id tensors (not Python lists) and dedup with
+    # torch.unique. The previous .tolist() + sorted(set(...)) allocated one
+    # Python int object per config id (millions of them, several GB at scale).
+    local = local_config_ids.detach().cpu().contiguous()
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    cat = torch.cat([g.to(local.dtype) for g in gathered])
+    return torch.unique(cat).to(dtype=local_config_ids.dtype, device='cpu')
