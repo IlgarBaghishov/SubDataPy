@@ -530,3 +530,67 @@ def leverage_scores_from_r(X, R, *, device='cuda', n_chunks=None,
             h[start:end] = torch.sum(B_chunk ** 2, dim=1).to(device)
             del X_chunk, B_chunk
     return h
+
+
+# ---------------------------------------------------------------------------
+# Residuals (chunked, memory-safe)
+# ---------------------------------------------------------------------------
+
+def chunked_sq_residuals(X, y, coeffs, *, device='cuda', n_chunks=None,
+                         local_devices=None):
+    """Squared residuals (X @ coeffs - y)^2, streaming X through GPU in chunks.
+
+    Mirrors the chunking used by tsqr / leverage so the full prediction
+    never materializes on a single GPU. X and y may live on CPU; coeffs is
+    moved to each local GPU. The squared-residual vector is returned on the
+    SAME device as X (CPU in chunked/partitioned modes, GPU otherwise) so it
+    aligns with the row masks the caller applies. Per-row residuals are
+    independent, so chunking is bit-for-bit equivalent to a single matmul.
+
+    Args:
+        X: (n, p) design matrix (can be on CPU).
+        y: (n,) or (n, 1) targets (same device as X).
+        coeffs: (p, 1) coefficients.
+        device: primary GPU for the single-device fast path.
+        n_chunks: number of chunks. None/<=1 with one local GPU => single
+            pass; otherwise n_chunks * len(local_devices) chunks.
+        local_devices: optional list of local CUDA devices to round-robin.
+
+    Returns:
+        sq_res: (n, 1) tensor of squared residuals on X.device.
+    """
+    if local_devices is None or len(local_devices) == 0:
+        local_devices = [device]
+    n_local_gpus = len(local_devices)
+    n = X.shape[0]
+    out_device = X.device
+    coeffs = coeffs.reshape(-1, 1)
+
+    if n == 0:
+        return torch.empty((0, 1), dtype=X.dtype, device=out_device)
+
+    # Single-pass when there is nothing to chunk across.
+    if (n_chunks is None or n_chunks <= 1) and n_local_gpus == 1:
+        with torch.no_grad():
+            r = X.to(device) @ coeffs.to(device) - y.to(device).reshape(-1, 1)
+            return (r * r).to(out_device)
+
+    per_chunks = n_chunks if (n_chunks is not None and n_chunks > 1) else 1
+    total_chunks = per_chunks * n_local_gpus
+    chunk_size = (n + total_chunks - 1) // total_chunks
+    coeffs_by_gpu = {g: coeffs.to(g) for g in local_devices}
+
+    out = torch.empty((n, 1), dtype=X.dtype, device=out_device)
+    with torch.no_grad():
+        for ci in range(total_chunks):
+            start = ci * chunk_size
+            end = min(start + chunk_size, n)
+            if start >= end:
+                break
+            gpu = local_devices[ci % n_local_gpus]
+            X_chunk = X[start:end].to(gpu)
+            y_chunk = y[start:end].to(gpu).reshape(-1, 1)
+            r = X_chunk @ coeffs_by_gpu[gpu] - y_chunk
+            out[start:end] = (r * r).to(out_device)
+            del X_chunk, y_chunk, r
+    return out

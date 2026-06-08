@@ -231,18 +231,25 @@ class BaseData:
         # by chunked/distributed modes where X doesn't fit on one GPU.
         train_target = self._train_target_device if self._train_target_device is not None else self.device
 
+        # Test data follows the same memory strategy as train: CPU in
+        # chunked/partitioned/distributed modes (then streamed to GPU in
+        # chunks at error time), GPU otherwise. Previously test was always
+        # pinned to self.device, so the whole test set (or the whole local
+        # test partition) landed on one GPU and OOMed while the chunked
+        # train path survived.
+        test_target = train_target
+
         self.X_train = self.X[self.train_mask].to(train_target)
         self.y_train = self.y[self.train_mask].to(train_target) if self.y is not None else None
         self.w_train = self.w[self.train_mask].to(train_target)
         self.enrow_mask_train = self.enrow_mask[self.train_mask].to(train_target) if self.enrow_mask is not None else None
         self.config_idxs_train = self.config_idxs[self.train_mask].to(device=train_target)
 
-        # Test data always goes to GPU
-        self.X_test = self.X[self.test_mask].to(self.device)
-        self.y_test = self.y[self.test_mask].to(self.device) if self.y is not None else None
-        self.w_test = self.w[self.test_mask].to(self.device)
-        self.enrow_mask_test = self.enrow_mask[self.test_mask].to(self.device) if self.enrow_mask is not None else None
-        self.config_idxs_test = self.config_idxs[self.test_mask].to(device=self.device)
+        self.X_test = self.X[self.test_mask].to(test_target)
+        self.y_test = self.y[self.test_mask].to(test_target) if self.y is not None else None
+        self.w_test = self.w[self.test_mask].to(test_target)
+        self.enrow_mask_test = self.enrow_mask[self.test_mask].to(test_target) if self.enrow_mask is not None else None
+        self.config_idxs_test = self.config_idxs[self.test_mask].to(device=test_target)
 
         # Per-config tensors for sampling operations.
         if self._is_partitioned and linalg.is_distributed():
@@ -282,32 +289,45 @@ class BaseData:
         del A, B
 
 
-    def compute_errors(self, verbose=True):
+    def compute_errors(self, verbose=True, n_chunks=None):
         if self.coeffs is None:
             raise ValueError("Model not trained.")
 
+        if n_chunks is None:
+            n_chunks = getattr(self, 'n_chunks', None)
         is_rank0 = linalg.get_rank() == 0
 
-        def get_rmse(X_data, y_true, mask, name):
-            mask_local = mask.to(X_data.device) if mask is not None else None
-            if X_data.shape[0] == 0 or (mask_local is not None and mask_local.sum() == 0):
+        # Stream each split through the GPU in chunks so the full prediction
+        # never materializes on one device (mirrors the train solver). The
+        # squared-residual vectors come back on the data's device (CPU in
+        # chunked/partitioned modes), aligned with the row masks below.
+        train_sq = linalg.chunked_sq_residuals(
+            self.X_train, self.y_train, self.coeffs, device=self.device,
+            n_chunks=n_chunks, local_devices=self.local_devices)
+        test_sq = linalg.chunked_sq_residuals(
+            self.X_test, self.y_test, self.coeffs, device=self.device,
+            n_chunks=n_chunks, local_devices=self.local_devices)
+
+        def get_rmse(sq, mask, name):
+            # distributed_rmse must be called by every rank the same number
+            # of times (it is a collective), so always reduce even when this
+            # rank's local contribution is empty.
+            if mask is None or sq.shape[0] == 0:
                 local_sq, local_n = 0.0, 0
             else:
-                coeffs = self.coeffs.to(X_data.device)
-                y_preds = X_data[mask_local] @ coeffs
-                sq_res = torch.square(y_preds - y_true[mask_local])
-                local_sq = float(sq_res.sum().item())
-                local_n = int(sq_res.numel())
-
+                sel = sq.reshape(-1)[mask.to(sq.device).reshape(-1)]
+                local_sq = float(sel.sum().item()) if sel.numel() > 0 else 0.0
+                local_n = int(sel.numel())
             rmse = linalg.distributed_rmse(local_sq, local_n, device=self.device)
             if rmse is not None and verbose and is_rank0:
                 print(f"{name} RMSE is {rmse}")
             return rmse
 
-        e_train = get_rmse(self.X_train, self.y_train, self.enrow_mask_train, "Energy training")
-        f_train = get_rmse(self.X_train, self.y_train, ~self.enrow_mask_train, "Force training")
-
-        e_test = get_rmse(self.X_test, self.y_test, self.enrow_mask_test, "Energy test")
-        f_test = get_rmse(self.X_test, self.y_test, ~self.enrow_mask_test, "Force test")
+        en_train = self.enrow_mask_train
+        en_test = self.enrow_mask_test
+        e_train = get_rmse(train_sq, en_train, "Energy training")
+        f_train = get_rmse(train_sq, ~en_train if en_train is not None else None, "Force training")
+        e_test = get_rmse(test_sq, en_test, "Energy test")
+        f_test = get_rmse(test_sq, ~en_test if en_test is not None else None, "Force test")
 
         return e_train, f_train, e_test, f_test

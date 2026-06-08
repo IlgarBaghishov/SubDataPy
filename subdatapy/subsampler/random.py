@@ -76,14 +76,21 @@ class RandomSubSampler(BaseData):
         del A, B
 
 
-    def compute_subsample_errors(self, verbose=False):
+    def compute_subsample_errors(self, verbose=False, n_chunks=None):
 
-        # Move coeffs to match X_train device (X_train may be on CPU in chunked mode)
-        train_coeffs = self.sub_coeffs.to(self.X_train.device)
-        train_preds = self.X_train @ train_coeffs
-        train_sq_res = torch.square(train_preds - self.y_train)
-        test_preds = self.X_test @ self.sub_coeffs
-        test_sq_res = torch.square(test_preds - self.y_test)
+        if n_chunks is None:
+            n_chunks = getattr(self, 'n_chunks', None)
+
+        # Stream train and test through the GPU in chunks so neither full
+        # prediction lands on one device. Squared residuals come back on the
+        # data's device (CPU in chunked/partitioned modes), matching the
+        # masks applied below.
+        train_sq_res = linalg.chunked_sq_residuals(
+            self.X_train, self.y_train, self.sub_coeffs, device=self.device,
+            n_chunks=n_chunks, local_devices=self.local_devices)
+        test_sq_res = linalg.chunked_sq_residuals(
+            self.X_test, self.y_test, self.sub_coeffs, device=self.device,
+            n_chunks=n_chunks, local_devices=self.local_devices)
 
         is_rank0 = linalg.get_rank() == 0
 
