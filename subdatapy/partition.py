@@ -118,10 +118,17 @@ def mmap_load_partition(
     end_row: int,
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    """Load a row range from a .npy file via memory mapping.
+    """Load a row range from a .npy file straight into one buffer (~1x RAM).
 
-    The slice is copied out of the mmap into a regular tensor that owns
-    its memory. The mmap is released after loading.
+    The slice is read directly from disk with ``np.fromfile`` at the row's
+    byte offset, so only the destination buffer is resident. The earlier
+    ``np.load(mmap_mode='r')`` + ``np.array(slice)`` held BOTH the destination
+    copy AND the memory-mapped source pages that get paged in to feed the
+    copy — ~2x peak RSS per rank. ``np.fromfile`` reads via the OS read cache
+    (kernel page cache, not counted against process RSS), so peak stays ~1x.
+
+    Falls back to the mmap+copy path for Fortran-ordered files (where row
+    slices are not contiguous on disk) or any header-parsing surprise.
 
     Args:
         file_path: Path to .npy file.
@@ -132,8 +139,33 @@ def mmap_load_partition(
     Returns:
         Tensor of shape (end_row - start_row, ...) on CPU.
     """
-    arr = np.load(file_path, mmap_mode='r')
-    partition = np.array(arr[start_row:end_row])  # copy from mmap
+    partition = None
+    try:
+        # Read header metadata only; mmap is lazy so no data pages are touched.
+        mm = np.load(file_path, mmap_mode='r')
+        file_dtype = mm.dtype
+        tail = tuple(mm.shape[1:])
+        ncols = int(np.prod(tail)) if mm.ndim > 1 else 1
+        data_offset = int(mm.offset)
+        c_contig = bool(mm.flags['C_CONTIGUOUS'])
+        del mm
+        if c_contig:
+            n = end_row - start_row
+            with open(file_path, 'rb') as f:
+                f.seek(data_offset + start_row * ncols * file_dtype.itemsize)
+                partition = np.fromfile(f, dtype=file_dtype, count=n * ncols)
+            if partition.size != n * ncols:
+                partition = None  # short read (e.g. truncated) -> fallback
+            elif tail:
+                partition = partition.reshape((n,) + tail)
+    except Exception:
+        partition = None
+
+    if partition is None:
+        arr = np.load(file_path, mmap_mode='r')
+        partition = np.array(arr[start_row:end_row])  # mmap+copy fallback
+        del arr
+
     return torch.from_numpy(partition).to(dtype=dtype, device='cpu')
 
 
