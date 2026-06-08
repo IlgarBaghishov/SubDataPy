@@ -181,12 +181,18 @@ def _reduce_r_matrices(r_list, device):
 # Core TSQR
 # ---------------------------------------------------------------------------
 
-def tsqr_r(X, *, device='cuda', n_chunks=None, tree_reduction_threshold=10,
-           partitioned=False, local_devices=None):
+def tsqr_r(X, *, x_idx=None, w=None, device='cuda', n_chunks=None,
+           tree_reduction_threshold=10, partitioned=False, local_devices=None):
     """Compute R factor of QR(X) for a tall-skinny matrix.
 
     Args:
-        X: (n, p) tensor, can be on CPU or GPU.
+        X: (N, p) tensor, can be on CPU or GPU. With ``x_idx`` it is the full
+            (host) matrix and only the selected rows are streamed to the
+            device — the row-scale data never leaves the CPU in full.
+        x_idx: Optional (n,) long tensor of row indices into ``X`` to use
+            (gathered per chunk). None = use all rows contiguously.
+        w: Optional (n,) / (n,1) per-row weights (in ``x_idx`` order) applied
+            on the device per chunk, so weighting never copies the full X.
         device: primary device for computation (first local GPU).
         n_chunks: Number of chunks to split the rows into before QR'ing.
               * Single-process (world_size=1): total chunk count. None
@@ -211,32 +217,33 @@ def tsqr_r(X, *, device='cuda', n_chunks=None, tree_reduction_threshold=10,
         R: (p, p) upper-triangular on *device*. Rank 0 only when
            partitioned+distributed; other ranks get None.
     """
-    R, _ = _tsqr_core(X, y=None, device=device, n_chunks=n_chunks,
+    R, _ = _tsqr_core(X, y=None, x_idx=x_idx, w=w, device=device, n_chunks=n_chunks,
                        tree_reduction_threshold=tree_reduction_threshold,
                        compute_xty=False, partitioned=partitioned,
                        local_devices=local_devices)
     return R
 
 
-def tsqr_r_xty(X, y, *, device='cuda', n_chunks=None, tree_reduction_threshold=10,
-               partitioned=False, local_devices=None):
+def tsqr_r_xty(X, y, *, x_idx=None, w=None, device='cuda', n_chunks=None,
+               tree_reduction_threshold=10, partitioned=False, local_devices=None):
     """Compute R factor and X^T y simultaneously.
 
-    Same modes and `n_chunks` semantics as :func:`tsqr_r` (see its
-    docstring for the per-rank vs global distinction). X^T y is
-    accumulated per-chunk and summed; in distributed mode it uses
-    dist.reduce(op=SUM).
+    Same modes and `n_chunks` semantics as :func:`tsqr_r` (see its docstring,
+    including ``x_idx``/``w`` for streamed weighted least squares). For WLS
+    pass the unweighted ``X``/``y`` plus ``w``; each chunk is scaled by ``w``
+    on the device, so R encodes ``X^T W^2 X`` and XTy encodes ``X^T W^2 y``
+    without ever materializing the weighted matrix on the host.
 
     Returns:
         (R, XTy) on rank 0; (None, None) on other ranks.
     """
-    return _tsqr_core(X, y=y, device=device, n_chunks=n_chunks,
+    return _tsqr_core(X, y=y, x_idx=x_idx, w=w, device=device, n_chunks=n_chunks,
                       tree_reduction_threshold=tree_reduction_threshold,
                       compute_xty=True, partitioned=partitioned,
                       local_devices=local_devices)
 
 
-def _tsqr_core(X, *, y=None, device='cuda', n_chunks=None,
+def _tsqr_core(X, *, y=None, x_idx=None, w=None, device='cuda', n_chunks=None,
                tree_reduction_threshold=10, compute_xty=True,
                partitioned=False, local_devices=None):
     """Unified implementation for tsqr_r and tsqr_r_xty.
@@ -281,17 +288,21 @@ def _tsqr_core(X, *, y=None, device='cuda', n_chunks=None,
     # --- Mode 1: single-pass (single process, single device, no chunks) ---
     if n_chunks is None and not partitioned and n_local_gpus == 1:
         with torch.no_grad():
-            X_dev = X.to(device)
+            X_dev = (X[x_idx] if x_idx is not None else X).to(device)
+            if w is not None:
+                X_dev = X_dev * w.to(device).reshape(-1, 1)
             with _cusolver_backend():
                 _, R = torch.linalg.qr(X_dev, mode='r')
             XTy = None
             if compute_xty and y is not None:
-                y_dev = y.to(device)
+                y_dev = y.to(device).reshape(-1, 1)
+                if w is not None:
+                    y_dev = y_dev * w.to(device).reshape(-1, 1)
                 XTy = X_dev.T @ y_dev
             return R, XTy
 
     # --- Chunked path (single-process-chunked OR partitioned multi-rank) ---
-    local_rows = X.shape[0]
+    local_rows = x_idx.shape[0] if x_idx is not None else X.shape[0]
     if partitioned:
         # Per-rank chunks; defaults to one chunk per local GPU.
         per_rank_chunks = n_chunks if n_chunks is not None else 1
@@ -311,12 +322,21 @@ def _tsqr_core(X, *, y=None, device='cuda', n_chunks=None,
             break
         gpu = local_devices[ci % n_local_gpus]
         with torch.no_grad():
-            X_chunk = X[start:end].to(gpu)
+            if x_idx is not None:
+                X_chunk = X[x_idx[start:end]].to(gpu)
+            else:
+                X_chunk = X[start:end].to(gpu)
+            wc = None
+            if w is not None:
+                wc = w[start:end].to(gpu).reshape(-1, 1)
+                X_chunk = X_chunk * wc
             with _cusolver_backend():
                 _, R_local = torch.linalg.qr(X_chunk, mode='r')
             R_list.append(R_local.to(device))
             if compute_xty and y is not None:
-                y_chunk = y[start:end].to(gpu)
+                y_chunk = y[start:end].to(gpu).reshape(-1, 1)
+                if wc is not None:
+                    y_chunk = y_chunk * wc
                 XTy_accum += (X_chunk.T @ y_chunk).to(device)
                 del y_chunk
             del X_chunk
@@ -479,16 +499,21 @@ def leverage_scores_from_qr(X, *, device='cuda'):
     return h
 
 
-def leverage_scores_from_r(X, R, *, device='cuda', n_chunks=None,
-                           local_devices=None):
+def leverage_scores_from_r(X, R, *, x_idx=None, w=None, device='cuda',
+                           n_chunks=None, local_devices=None):
     """Compute leverage scores h_i = ||R^{-T} x_i||^2.
 
     When n_chunks is set, streams X through GPU in chunks to avoid
     loading the full matrix. X can reside on CPU.
 
     Args:
-        X: (n, p) matrix (can be on CPU)
+        X: (N, p) matrix (can be on CPU). With ``x_idx`` it is the full host
+            matrix and only the selected rows are streamed.
         R: (p, p) upper-triangular R factor
+        x_idx: Optional (n,) row indices into ``X`` (gathered per chunk).
+            None = all rows contiguously.
+        w: Optional (n,) / (n,1) per-row weights (in ``x_idx`` order) applied
+            on the device per chunk — pass the same weighting used to build R.
         device: primary device for output and single-GPU path
         n_chunks: number of chunks (None = single pass, moves full X to device)
         local_devices: optional list of local CUDA devices to round-robin
@@ -501,11 +526,13 @@ def leverage_scores_from_r(X, R, *, device='cuda', n_chunks=None,
         local_devices = [device]
     n_local_gpus = len(local_devices)
 
-    n = X.shape[0]
+    n = x_idx.shape[0] if x_idx is not None else X.shape[0]
 
     if (n_chunks is None or n_chunks <= 1) and n_local_gpus == 1:
         R_dev = R.to(device)
-        X_dev = X.to(device)
+        X_dev = (X[x_idx] if x_idx is not None else X).to(device)
+        if w is not None:
+            X_dev = X_dev * w.to(device).reshape(-1, 1)
         B = torch.linalg.solve_triangular(R_dev.T, X_dev.T, upper=False).T
         return torch.sum(B ** 2, dim=1)
 
@@ -524,7 +551,12 @@ def leverage_scores_from_r(X, R, *, device='cuda', n_chunks=None,
             if start >= end:
                 break
             gpu = local_devices[ci % n_local_gpus]
-            X_chunk = X[start:end].to(gpu)
+            if x_idx is not None:
+                X_chunk = X[x_idx[start:end]].to(gpu)
+            else:
+                X_chunk = X[start:end].to(gpu)
+            if w is not None:
+                X_chunk = X_chunk * w[start:end].to(gpu).reshape(-1, 1)
             B_chunk = torch.linalg.solve_triangular(
                 R_by_gpu[gpu].T, X_chunk.T, upper=False).T
             h[start:end] = torch.sum(B_chunk ** 2, dim=1).to(device)
@@ -536,21 +568,24 @@ def leverage_scores_from_r(X, R, *, device='cuda', n_chunks=None,
 # Residuals (chunked, memory-safe)
 # ---------------------------------------------------------------------------
 
-def chunked_sq_residuals(X, y, coeffs, *, device='cuda', n_chunks=None,
-                         local_devices=None):
+def chunked_sq_residuals(X, y, coeffs, *, x_idx=None, device='cuda',
+                         n_chunks=None, local_devices=None):
     """Squared residuals (X @ coeffs - y)^2, streaming X through GPU in chunks.
 
     Mirrors the chunking used by tsqr / leverage so the full prediction
     never materializes on a single GPU. X and y may live on CPU; coeffs is
-    moved to each local GPU. The squared-residual vector is returned on the
-    SAME device as X (CPU in chunked/partitioned modes, GPU otherwise) so it
-    aligns with the row masks the caller applies. Per-row residuals are
-    independent, so chunking is bit-for-bit equivalent to a single matmul.
+    moved to each local GPU. With ``x_idx`` only the selected rows of the
+    full host ``X`` are streamed (and ``y`` is the targets in ``x_idx``
+    order). The squared-residual vector is returned on ``X.device`` (CPU in
+    chunked/partitioned modes) so it aligns with the row masks the caller
+    applies. Per-row residuals are independent, so chunking is bit-for-bit
+    equivalent to a single matmul. Errors are unweighted by design.
 
     Args:
-        X: (n, p) design matrix (can be on CPU).
-        y: (n,) or (n, 1) targets (same device as X).
+        X: (N, p) design matrix (can be on CPU).
+        y: (n,) or (n, 1) targets in x_idx order (same device as X).
         coeffs: (p, 1) coefficients.
+        x_idx: Optional (n,) row indices into X. None = all rows contiguously.
         device: primary GPU for the single-device fast path.
         n_chunks: number of chunks. None/<=1 with one local GPU => single
             pass; otherwise n_chunks * len(local_devices) chunks.
@@ -562,7 +597,7 @@ def chunked_sq_residuals(X, y, coeffs, *, device='cuda', n_chunks=None,
     if local_devices is None or len(local_devices) == 0:
         local_devices = [device]
     n_local_gpus = len(local_devices)
-    n = X.shape[0]
+    n = x_idx.shape[0] if x_idx is not None else X.shape[0]
     out_device = X.device
     coeffs = coeffs.reshape(-1, 1)
 
@@ -572,7 +607,8 @@ def chunked_sq_residuals(X, y, coeffs, *, device='cuda', n_chunks=None,
     # Single-pass when there is nothing to chunk across.
     if (n_chunks is None or n_chunks <= 1) and n_local_gpus == 1:
         with torch.no_grad():
-            r = X.to(device) @ coeffs.to(device) - y.to(device).reshape(-1, 1)
+            X_sel = (X[x_idx] if x_idx is not None else X).to(device)
+            r = X_sel @ coeffs.to(device) - y.to(device).reshape(-1, 1)
             return (r * r).to(out_device)
 
     per_chunks = n_chunks if (n_chunks is not None and n_chunks > 1) else 1
@@ -588,7 +624,10 @@ def chunked_sq_residuals(X, y, coeffs, *, device='cuda', n_chunks=None,
             if start >= end:
                 break
             gpu = local_devices[ci % n_local_gpus]
-            X_chunk = X[start:end].to(gpu)
+            if x_idx is not None:
+                X_chunk = X[x_idx[start:end]].to(gpu)
+            else:
+                X_chunk = X[start:end].to(gpu)
             y_chunk = y[start:end].to(gpu).reshape(-1, 1)
             r = X_chunk @ coeffs_by_gpu[gpu] - y_chunk
             out[start:end] = (r * r).to(out_device)
