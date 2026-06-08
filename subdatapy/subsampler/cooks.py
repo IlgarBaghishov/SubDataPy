@@ -165,14 +165,21 @@ class CookSubSampler(RandomSubSampler):
     def _onestep_cooks_sampling(self):
         if self.block:
             raise NotImplementedError("Onestep Block Cook's Distance methods are not implemented yet.")
-        if self._needs_chunking():
-            raise NotImplementedError(
-                "One-step Cook's does not support chunked/distributed mode. "
-                "Use stepwise=True for chunked operation.")
+        # auto/qr -> TSQR path (chunkable + distributed); svd -> single-pass.
+        if self._use_qr_factorization():
+            self._onestep_cooks_qr()
+        else:
+            if self._needs_chunking():
+                raise NotImplementedError(
+                    "One-step Cook's with factorization='svd' does not support "
+                    "chunked/distributed mode. Use factorization='qr' or 'auto', "
+                    "or stepwise=True.")
+            self._onestep_cooks_svd()
 
-        # X_train/y_train are weighted in place by _create_sub_mask; gather the
-        # weighted training rows (and energy mask) to the device for the single
-        # SVD. The host design matrix is never SVD'd in place.
+    def _onestep_cooks_svd(self):
+        # Single-pass OLS/WLS leverage from the SVD. X_train/y_train are
+        # weighted in place by _create_sub_mask; gather them to the device for
+        # the dense SVD (the host design matrix is never SVD'd in place).
         Xtr = self.X_train.to(self.device)
         ytr = self.y_train.to(self.device)
         enrow = self.enrow_mask_train.to(self.device)
@@ -192,24 +199,72 @@ class CookSubSampler(RandomSubSampler):
 
         preds = Xtr[enrow] @ coeffs
         en_residuals_sq = torch.square(preds - ytr[enrow]).reshape(-1)
+        cooks = en_residuals_sq * leverage_scores / (1 - leverage_scores) ** 2
 
-        self.onestep_en_cooks = en_residuals_sq * leverage_scores / (1 - leverage_scores) ** 2
+        # Map cooks (energy-row order) back to config ids. Single-process only:
+        # energy rows are in config order, matching unique_config_idxs_train.
+        self.onestep_en_cooks = cooks
+        self._onestep_select(cooks.cpu(), self.unique_config_idxs_train.cpu())
 
-        if self.sampling:
-            cooks_probs = self.onestep_en_cooks / torch.sum(self.onestep_en_cooks)
-            # CPU RNG so CPU and CUDA runs with the same seed pick identical
-            # configs (CUDA RNG is an independent stream).
-            indices = torch.multinomial(cooks_probs.cpu(), self.n_subsamples,
-                                        replacement=False)
-            sub_unique_config_idxs_train = self.unique_config_idxs_train.cpu()[indices]
+    def _onestep_cooks_qr(self):
+        # TSQR leverage: R/X^T y from all (in-place weighted) train rows,
+        # streamed/chunked; leverage h_i = ||R^{-T} x_i||^2 and residuals on
+        # the (small) energy rows only. Works single-process, chunked, and
+        # partitioned-distributed.
+        distributed = linalg.is_distributed()
+        rank = linalg.get_rank()
+        p = self.X_train.shape[1]
+
+        R, XTy = linalg.tsqr_r_xty(
+            self.X_train, self.y_train, device=self.device, n_chunks=self.n_chunks,
+            tree_reduction_threshold=self.tree_reduction_threshold,
+            partitioned=self._is_partitioned, local_devices=self.local_devices)
+        if distributed:
+            R = linalg.broadcast_tensor(R if rank == 0 else None, src=0,
+                                        shape=(p, p), dtype=self.dtype, device=self.device)
+            XTy = linalg.broadcast_tensor(XTy if rank == 0 else None, src=0,
+                                          shape=(p, 1), dtype=self.dtype, device=self.device)
+        coeffs = linalg.solve_from_r_xty(R, XTy)
+
+        # Energy rows only (one per config) — small, gather to the device.
+        en = self.enrow_mask_train
+        if int(en.sum()) > 0:
+            Xen = self.X_train[en].to(self.device)
+            yen = self.y_train[en].to(self.device)
+            h = linalg.leverage_scores_from_r(Xen, R, device=self.device).reshape(-1)
+            e = (Xen @ coeffs - yen).reshape(-1)
+            cooks = (e ** 2 * h / (1 - h) ** 2).cpu()
+            en_config_ids = self.config_idxs_train[en].cpu()
         else:
-            topk_vals, topk_indices = torch.topk(self.onestep_en_cooks, self.n_subsamples)
-            sub_unique_config_idxs_train = self.unique_config_idxs_train.cpu()[topk_indices.cpu()]
+            cooks = torch.empty(0, dtype=self.dtype)
+            en_config_ids = torch.empty(0, dtype=torch.int64)
 
-        self.sub_mask = torch.isin(self.config_idxs, sub_unique_config_idxs_train.to(device='cpu'))
+        self.onestep_en_cooks = cooks
+        # Robust config-id mapping (works when energy rows span ranks).
+        if distributed:
+            pairs = [None] * linalg.get_world_size()
+            dist.all_gather_object(pairs, (en_config_ids.tolist(), cooks.tolist()))
+            ids, vals = [], []
+            for cid_list, v_list in pairs:
+                ids.extend(cid_list)
+                vals.extend(v_list)
+            en_config_ids = torch.tensor(ids, dtype=torch.int64)
+            cooks = torch.tensor(vals, dtype=self.dtype)
+        self._onestep_select(cooks, en_config_ids)
+
+    def _onestep_select(self, cooks, config_ids):
+        """Pick n_subsamples configs from per-config Cook's scores (CPU) and set
+        sub_mask / sub_mask_train. cooks and config_ids are aligned 1-D CPU
+        tensors. Sampling uses CPU RNG so CPU and CUDA runs match."""
+        if self.sampling:
+            probs = cooks / torch.sum(cooks)
+            idx = torch.multinomial(probs, self.n_subsamples, replacement=False)
+        else:
+            _, idx = torch.topk(cooks, self.n_subsamples)
+        chosen = config_ids[idx]
+        self.sub_mask = torch.isin(self.config_idxs, chosen)
         self.sub_mask_train = torch.isin(
-            self.config_idxs_train,
-            sub_unique_config_idxs_train.to(self.config_idxs_train.device))
+            self.config_idxs_train, chosen.to(self.config_idxs_train.device))
 
     # ------------------------------------------------------------------
     # Initial subset
