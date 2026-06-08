@@ -65,34 +65,54 @@ def get_local_devices(device='cuda'):
     return [device]
 
 
-def solve_wls(A, B, *, method, device, n_chunks, partitioned, local_devices, dtype):
-    """Weighted least-squares solve: coeffs = argmin ||A coeffs - B||^2.
+def solve_wls(X, y, w, *, x_idx=None, method='auto', device, n_chunks,
+              partitioned, local_devices, dtype):
+    """Weighted least squares from row-scale data kept on the host.
 
-    Exactly the pattern used by both ``BaseData.train`` and
-    ``RandomSubSampler.train_subsample``: auto-switch ``'lstsq'`` to
-    ``'qr'`` under torch.distributed (lstsq needs the full replicated
-    matrix), run TSQR when ``method == 'qr'``, and broadcast the rank-0
-    coeffs so every rank ends with the same answer.
+    coeffs = argmin ||W (X[x_idx] coeffs - y)||^2.
+
+    ``X`` is the full (host) design matrix; ``x_idx`` selects the rows to fit
+    (None = all rows); ``y``/``w`` are the per-row target/weight in ``x_idx``
+    order (``w`` None = unit weights). The weighted matrix is never built on
+    the host — chunks are gathered and scaled on the device.
+
+    ``method``:
+      * ``'auto'`` (default): single-pass ``lstsq`` when it all fits one
+        device (``world_size==1`` and ``n_chunks<=1``), TSQR otherwise.
+      * ``'lstsq'``: single-pass, but auto-upgrades to TSQR when streaming is
+        required (distributed or ``n_chunks>1``).
+      * ``'qr'``: always TSQR.
 
     Returns the (p, 1) coefficients on ``device``.
     """
-    if is_distributed() and method == 'lstsq':
-        method = 'qr'
+    n_features = X.shape[1]
+    streamed = is_distributed() or (n_chunks is not None and n_chunks > 1)
+    if method == 'auto':
+        method = 'qr' if streamed else 'lstsq'
+    elif method == 'lstsq' and streamed:
+        method = 'qr'   # lstsq needs the whole matrix on one device
 
     if method == 'qr':
-        R, XTy = tsqr_r_xty(A, B, device=device, n_chunks=n_chunks,
+        R, XTy = tsqr_r_xty(X, y, x_idx=x_idx, w=w, device=device, n_chunks=n_chunks,
                             partitioned=partitioned, local_devices=local_devices)
         coeffs = solve_from_r_xty(R, XTy) if R is not None else None
         if is_distributed():
             coeffs = broadcast_tensor(
                 coeffs if get_rank() == 0 else None,
-                src=0, shape=(A.shape[1], 1), dtype=dtype, device=device)
+                src=0, shape=(n_features, 1), dtype=dtype, device=device)
         return coeffs
 
     if method == 'lstsq':
-        return torch.linalg.lstsq(A, B).solution
+        # Single-pass: gather the selected rows onto the device, weight there.
+        Xg = (X[x_idx] if x_idx is not None else X).to(device)
+        B = y.to(device).reshape(-1, 1)
+        if w is not None:
+            wv = w.to(device).reshape(-1, 1)
+            Xg = Xg * wv
+            B = B * wv
+        return torch.linalg.lstsq(Xg, B).solution
 
-    raise ValueError(f"Unknown method {method!r}; expected 'lstsq' or 'qr'.")
+    raise ValueError(f"Unknown method {method!r}; expected 'auto', 'lstsq', or 'qr'.")
 
 
 def distributed_rmse(local_sq, local_n, *, device):

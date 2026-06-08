@@ -40,9 +40,10 @@ def _make_npy_dataset(tmp_path, n_configs=20, rows_per_config=5, n_features=8):
 # C1: BaseData full-train in partitioned mode honors a CPU train target
 # ---------------------------------------------------------------------------
 
-def test_partitioned_loader_defaults_train_target_to_cpu(tmp_path):
-    """In partitioned mode, _load_partitioned must default the train target
-    to CPU so train_test_split does not move the partition onto GPU.
+def test_partitioned_loader_keeps_design_matrix_on_cpu(tmp_path):
+    """Per the device rule, partitioned BaseData keeps the design matrix on
+    CPU and records train/test row indices instead of copying X_train/X_test
+    onto the GPU (which previously OOMed on large partitions).
 
     The auto-trigger requires world_size>1, so we drive _load_partitioned
     directly via a single-rank gloo group (just enough for the broadcast +
@@ -68,18 +69,19 @@ def test_partitioned_loader_defaults_train_target_to_cpu(tmp_path):
         bd.coeffs = None
         bd.local_devices = ["cpu"]
         bd._is_partitioned = True
-        # _train_target_device normally set in __init__; stays None so that
-        # _load_partitioned can flip it to 'cpu' (that's the bug we're
-        # regression-testing).
-        bd._train_target_device = None
         bd._unique_config_idxs_train_override = None
         bd._load_partitioned(paths["X"], paths["y"], paths["w"],
                              paths["config_idxs"], paths["enrow_mask"],
                              intercept=True)
         bd.train_test_split(test_fraction=0.5, seed=41)
-        assert bd.X_train.device.type == "cpu", (
-            f"BUG C1: partitioned BaseData X_train on {bd.X_train.device}; "
-            f"should be cpu to avoid OOM on large partitions")
+        # The design matrix stays on CPU and is never copied into X_train.
+        assert bd.X.device.type == "cpu"
+        assert not hasattr(bd, "X_train"), (
+            "BaseData must not materialize X_train; it should stream "
+            "self.X[train_idx] in chunks instead")
+        assert bd.train_idx.numel() + bd.test_idx.numel() == bd.X.shape[0]
+        # Indices are aligned with the per-row siblings (increasing row order).
+        assert bd.y_train.shape[0] == bd.train_idx.numel()
     finally:
         dist.destroy_process_group()
         for k in ("RANK", "WORLD_SIZE"):

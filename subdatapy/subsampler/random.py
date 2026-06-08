@@ -10,14 +10,12 @@ class RandomSubSampler(BaseData):
 
     def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None,
                  enrow_mask=None, intercept=True, device='cuda',
-                 train_target_device=None,
                  local_devices=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None):
         super().__init__(
             X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask,
             intercept=intercept, device=device, local_devices=local_devices,
-            train_target_device=train_target_device,
             partitioned_override=partitioned_override,
             unique_config_idxs_train_override=unique_config_idxs_train_override,
         )
@@ -59,21 +57,25 @@ class RandomSubSampler(BaseData):
 
 
     def _subsample(self):
-        self.sub_X_train = self.X[self.sub_mask].to(device=self.device)
+        # Record which training rows fall in the subsample as indices into
+        # self.X (no design-matrix copy); train_subsample streams them. The
+        # subsample is always a subset of train, so its rows are train rows.
+        sub_mask_train_cpu = self.sub_mask_train.to('cpu')
+        self.sub_idx = self.train_idx[sub_mask_train_cpu]
         if self.y is not None:
-            self.sub_y_train = self.y[self.sub_mask].to(device=self.device)
+            self.sub_y_train = self.y_train[sub_mask_train_cpu]
         if self.w is not None:
-            self.sub_w_train = self.w[self.sub_mask].to(device=self.device)
+            self.sub_w_train = self.w_train[sub_mask_train_cpu]
 
 
-    def train_subsample(self, method='lstsq', n_chunks=None):
-        A = self.sub_w_train * self.sub_X_train
-        B = self.sub_w_train * self.sub_y_train
+    def train_subsample(self, method='auto', n_chunks=None):
+        # Stream the subsampled rows from self.X (weighted on the device per
+        # chunk); the weighted subsample is never built on the host.
         self.sub_coeffs = linalg.solve_wls(
-            A, B, method=method, device=self.device, n_chunks=n_chunks,
+            self.X, self.sub_y_train, self.sub_w_train, x_idx=self.sub_idx,
+            method=method, device=self.device, n_chunks=n_chunks,
             partitioned=self._is_partitioned, local_devices=self.local_devices,
             dtype=self.dtype)
-        del A, B
 
 
     def compute_subsample_errors(self, verbose=False, n_chunks=None):
@@ -81,16 +83,15 @@ class RandomSubSampler(BaseData):
         if n_chunks is None:
             n_chunks = getattr(self, 'n_chunks', None)
 
-        # Stream train and test through the GPU in chunks so neither full
-        # prediction lands on one device. Squared residuals come back on the
-        # data's device (CPU in chunked/partitioned modes), matching the
-        # masks applied below.
+        # Stream train and test through the device in chunks so neither full
+        # prediction lands on one device. Squared residuals come back on
+        # self.X.device (CPU), matching the CPU row masks applied below.
         train_sq_res = linalg.chunked_sq_residuals(
-            self.X_train, self.y_train, self.sub_coeffs, device=self.device,
-            n_chunks=n_chunks, local_devices=self.local_devices)
+            self.X, self.y_train, self.sub_coeffs, x_idx=self.train_idx,
+            device=self.device, n_chunks=n_chunks, local_devices=self.local_devices)
         test_sq_res = linalg.chunked_sq_residuals(
-            self.X_test, self.y_test, self.sub_coeffs, device=self.device,
-            n_chunks=n_chunks, local_devices=self.local_devices)
+            self.X, self.y_test, self.sub_coeffs, x_idx=self.test_idx,
+            device=self.device, n_chunks=n_chunks, local_devices=self.local_devices)
 
         is_rank0 = linalg.get_rank() == 0
 
@@ -102,20 +103,23 @@ class RandomSubSampler(BaseData):
                 print(f"{name}: {val}")
             return val
 
-        # Subsampled Train
-        mask_sub_en = self.sub_mask_train & self.enrow_mask_train
-        e_sub = get_rmse(train_sq_res[mask_sub_en], "Subsampled Training Data Energy RMSE")
+        # Row masks may live on a different device than the residuals (e.g.
+        # stepwise Cook's moves some to the GPU); align them to the residuals.
+        en_tr = self.enrow_mask_train.to(train_sq_res.device)
+        sub_tr = self.sub_mask_train.to(train_sq_res.device)
+        en_te = self.enrow_mask_test.to(test_sq_res.device)
 
-        mask_sub_f = self.sub_mask_train & (~self.enrow_mask_train)
-        f_sub = get_rmse(train_sq_res[mask_sub_f], "Subsampled Training Data Force RMSE")
+        # Subsampled Train
+        e_sub = get_rmse(train_sq_res[sub_tr & en_tr], "Subsampled Training Data Energy RMSE")
+        f_sub = get_rmse(train_sq_res[sub_tr & (~en_tr)], "Subsampled Training Data Force RMSE")
 
         # Entire Train
-        e_train = get_rmse(train_sq_res[self.enrow_mask_train], "Entire Training Data Energy RMSE")
-        f_train = get_rmse(train_sq_res[~self.enrow_mask_train], "Entire Training Data Force RMSE")
+        e_train = get_rmse(train_sq_res[en_tr], "Entire Training Data Energy RMSE")
+        f_train = get_rmse(train_sq_res[~en_tr], "Entire Training Data Force RMSE")
 
         # Test
-        e_test = get_rmse(test_sq_res[self.enrow_mask_test], "Energy Test RMSE")
-        f_test = get_rmse(test_sq_res[~self.enrow_mask_test], "Force Test RMSE")
+        e_test = get_rmse(test_sq_res[en_te], "Energy Test RMSE")
+        f_test = get_rmse(test_sq_res[~en_te], "Force Test RMSE")
 
         return e_sub, f_sub, e_train, f_train, e_test, f_test
 

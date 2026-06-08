@@ -67,16 +67,9 @@ class BaseData:
 
     def __init__(self, X, y=None, w=None, config_idxs=None, enrow_mask=None,
                  intercept=True, device='cuda', local_devices=None,
-                 train_target_device=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None):
         """Args:
-            train_target_device: Device to place X_train/y_train/w_train on
-                after train_test_split. None -> self.device (single-process
-                default); 'cpu' -> keep training data off GPU (used in
-                chunked/distributed modes). Replaces the older pattern of
-                setting a `_train_target_device` attribute before calling
-                super().__init__().
             partitioned_override: Force `_is_partitioned` to this value
                 instead of auto-detecting from (distributed AND file-path
                 inputs). Used by nested samplers in CookSubSampler to
@@ -86,11 +79,16 @@ class BaseData:
                 per-rank unique_config_idxs_train computed during
                 train_test_split. Used by nested samplers to see the global
                 config-id list rather than their partition-local view.
+
+        Device rule (see README): row-scale data (X and the per-row/per-config
+        arrays) lives on the host CPU; the device only ever holds the small
+        model-scale factors and one streamed chunk at a time. There is no
+        train/test target switch — train_test_split keeps the design matrix on
+        CPU and records row indices instead of copying out X_train/X_test.
         """
         self.device = device
         self.dtype = torch.float64
         self.coeffs = None
-        self._train_target_device = train_target_device
         self._unique_config_idxs_train_override = unique_config_idxs_train_override
 
         # Multi-GPU within a rank: list of local CUDA devices.
@@ -150,11 +148,8 @@ class BaseData:
     def _load_partitioned(self, X_path, y_path, w_path, config_idxs_path,
                           enrow_mask_path, intercept):
         """Load only this rank's slice of data from .npy files via mmap."""
-        # Partitioned mode exists to keep large data off any single GPU.
-        # Default train target to CPU unless the caller set it explicitly.
-        if self._train_target_device is None:
-            self._train_target_device = 'cpu'
-
+        # Partitioned mode keeps large data off any single GPU. The design
+        # matrix stays on CPU per the device rule; no train target to set.
         world_size = linalg.get_world_size()
         rank = linalg.get_rank()
 
@@ -226,30 +221,25 @@ class BaseData:
 
         self.train_mask = ~self.test_mask
 
-        # Training data target (explicit kwarg at construction time). None
-        # => the primary device; 'cpu' => keep training data off GPU, used
-        # by chunked/distributed modes where X doesn't fit on one GPU.
-        train_target = self._train_target_device if self._train_target_device is not None else self.device
+        # Device rule: the design matrix stays on the host CPU. Record which
+        # rows are train/test as index tensors instead of copying X_train /
+        # X_test out of self.X — consumers stream self.X[train_idx] /
+        # [test_idx] to the device in chunks. The per-row siblings (y, w,
+        # enrow, config_idxs) are each 1/p the size of X, so they are kept
+        # materialized on CPU; they index by chunk position, aligned with
+        # train_idx / test_idx (which are in increasing row order).
+        self.train_idx = self.train_mask.nonzero(as_tuple=True)[0]
+        self.test_idx = self.test_mask.nonzero(as_tuple=True)[0]
 
-        # Test data follows the same memory strategy as train: CPU in
-        # chunked/partitioned/distributed modes (then streamed to GPU in
-        # chunks at error time), GPU otherwise. Previously test was always
-        # pinned to self.device, so the whole test set (or the whole local
-        # test partition) landed on one GPU and OOMed while the chunked
-        # train path survived.
-        test_target = train_target
+        self.y_train = self.y[self.train_mask] if self.y is not None else None
+        self.w_train = self.w[self.train_mask]
+        self.enrow_mask_train = self.enrow_mask[self.train_mask] if self.enrow_mask is not None else None
+        self.config_idxs_train = self.config_idxs[self.train_mask]
 
-        self.X_train = self.X[self.train_mask].to(train_target)
-        self.y_train = self.y[self.train_mask].to(train_target) if self.y is not None else None
-        self.w_train = self.w[self.train_mask].to(train_target)
-        self.enrow_mask_train = self.enrow_mask[self.train_mask].to(train_target) if self.enrow_mask is not None else None
-        self.config_idxs_train = self.config_idxs[self.train_mask].to(device=train_target)
-
-        self.X_test = self.X[self.test_mask].to(test_target)
-        self.y_test = self.y[self.test_mask].to(test_target) if self.y is not None else None
-        self.w_test = self.w[self.test_mask].to(test_target)
-        self.enrow_mask_test = self.enrow_mask[self.test_mask].to(test_target) if self.enrow_mask is not None else None
-        self.config_idxs_test = self.config_idxs[self.test_mask].to(device=test_target)
+        self.y_test = self.y[self.test_mask] if self.y is not None else None
+        self.w_test = self.w[self.test_mask]
+        self.enrow_mask_test = self.enrow_mask[self.test_mask] if self.enrow_mask is not None else None
+        self.config_idxs_test = self.config_idxs[self.test_mask]
 
         # Per-config tensors for sampling operations.
         if self._is_partitioned and linalg.is_distributed():
@@ -268,25 +258,30 @@ class BaseData:
             self.unique_config_idxs_train = self._unique_config_idxs_train_override.to(self.device)
 
 
-    def train(self, method='lstsq', n_chunks=None):
+    def _materialize_train_X(self, target='cpu'):
+        """TEMP (Stage 2): build X_train/X_test from the row indices for paths
+        not yet converted to index streaming (stepwise/block/one-step Cook's).
+        Reintroduces the per-split design-matrix copy for those paths only; the
+        row-scale siblings stay on CPU per the device rule."""
+        self.X_train = self.X[self.train_idx].to(target)
+        self.X_test = self.X[self.test_idx].to(target)
+
+    def train(self, method='auto', n_chunks=None):
         """Weighted Least Squares training.
 
         Args:
-            method: 'lstsq' (default, torch.linalg.lstsq) or 'qr' (via TSQR)
-            n_chunks: For 'qr' method, number of chunks. None = auto.
+            method: 'auto' (default; single-pass lstsq when it fits one device,
+                TSQR otherwise), 'lstsq', or 'qr'. The weighted matrix is never
+                built on the host — chunks of self.X[train_idx] are gathered
+                and scaled by w on the device.
+            n_chunks: number of TSQR chunks (user-supplied; None = single pass
+                per rank).
         """
-        A = self.X_train.clone()
-        A.mul_(self.w_train)
-
-        B = self.y_train.clone()
-        B.mul_(self.w_train)
-        B = B.reshape(-1, 1)
-
         self.coeffs = linalg.solve_wls(
-            A, B, method=method, device=self.device, n_chunks=n_chunks,
+            self.X, self.y_train, self.w_train, x_idx=self.train_idx,
+            method=method, device=self.device, n_chunks=n_chunks,
             partitioned=self._is_partitioned, local_devices=self.local_devices,
             dtype=self.dtype)
-        del A, B
 
 
     def compute_errors(self, verbose=True, n_chunks=None):
@@ -302,11 +297,11 @@ class BaseData:
         # squared-residual vectors come back on the data's device (CPU in
         # chunked/partitioned modes), aligned with the row masks below.
         train_sq = linalg.chunked_sq_residuals(
-            self.X_train, self.y_train, self.coeffs, device=self.device,
-            n_chunks=n_chunks, local_devices=self.local_devices)
+            self.X, self.y_train, self.coeffs, x_idx=self.train_idx,
+            device=self.device, n_chunks=n_chunks, local_devices=self.local_devices)
         test_sq = linalg.chunked_sq_residuals(
-            self.X_test, self.y_test, self.coeffs, device=self.device,
-            n_chunks=n_chunks, local_devices=self.local_devices)
+            self.X, self.y_test, self.coeffs, x_idx=self.test_idx,
+            device=self.device, n_chunks=n_chunks, local_devices=self.local_devices)
 
         def get_rmse(sq, mask, name):
             # distributed_rmse must be called by every rank the same number

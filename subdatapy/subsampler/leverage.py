@@ -12,20 +12,13 @@ class LeverageSubSampler(RandomSubSampler):
                  factorization='auto',   # 'svd', 'qr', or 'auto'
                  n_chunks=None,
                  local_devices=None,
-                 train_target_device=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None,
                  ):
-        # Keep training data on CPU when chunking/distributed so the full X
-        # never ends up on one GPU.
-        if train_target_device is None and (n_chunks is not None or linalg.is_distributed()):
-            train_target_device = 'cpu'
-
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed,
                          config_idxs=config_idxs, enrow_mask=enrow_mask,
                          intercept=intercept, device=device,
                          local_devices=local_devices,
-                         train_target_device=train_target_device,
                          partitioned_override=partitioned_override,
                          unique_config_idxs_train_override=unique_config_idxs_train_override)
         self.block = block
@@ -37,37 +30,41 @@ class LeverageSubSampler(RandomSubSampler):
 
     def _create_sub_mask(self):
 
-        # 1. Compute weighted X (stays on whatever device X_train is on)
-        X_w = self.w_train.reshape(-1, 1) * self.X_train
-
-        # 2. Compute leverage scores
+        # 1-2. Leverage scores over the weighted training rows, streamed from
+        # the host design matrix by index — the weighted matrix is never built
+        # on the host. p = number of features.
+        p = self.X.shape[1]
         use_qr = (self.factorization == 'qr' or
                   (self.factorization == 'auto' and
                    (self.n_chunks is not None or linalg.is_distributed())))
 
         if use_qr:
             if self.n_chunks is None and not linalg.is_distributed():
-                # Single-pass: retain Q, compute ||Q_i||^2 — O(np)
+                # Single-pass: gather+weight the train rows on the device,
+                # retain Q, compute ||Q_i||^2 — O(np).
+                X_w = (self.w_train.reshape(-1, 1) * self.X[self.train_idx]).to(self.device)
                 row_leverage = linalg.leverage_scores_from_qr(X_w, device=self.device)
             else:
                 # Chunked/distributed: TSQR for R, then chunked leverage — O(np^2)
                 R = linalg.tsqr_r(
-                    X_w, device=self.device, n_chunks=self.n_chunks,
+                    self.X, x_idx=self.train_idx, w=self.w_train,
+                    device=self.device, n_chunks=self.n_chunks,
                     partitioned=self._is_partitioned,
                     local_devices=self.local_devices)
                 if linalg.is_distributed():
                     # Broadcast R to all ranks so every rank can compute local h_i.
-                    p = X_w.shape[1]
                     R = linalg.broadcast_tensor(
                         R if linalg.get_rank() == 0 else None,
-                        src=0, shape=(p, p), dtype=X_w.dtype, device=self.device)
+                        src=0, shape=(p, p), dtype=self.dtype, device=self.device)
                 row_leverage = linalg.leverage_scores_from_r(
-                    X_w, R, device=self.device, n_chunks=self.n_chunks,
+                    self.X, R, x_idx=self.train_idx, w=self.w_train,
+                    device=self.device, n_chunks=self.n_chunks,
                     local_devices=self.local_devices)
         else:
-            # SVD path (original behavior)
+            # SVD path (single-pass): gather+weight the train rows on the device.
             if self.U is None:
-                self.U, self.S, self.Vh = torch.linalg.svd(X_w.to(self.device), full_matrices=False)
+                X_w = (self.w_train.reshape(-1, 1) * self.X[self.train_idx]).to(self.device)
+                self.U, self.S, self.Vh = torch.linalg.svd(X_w, full_matrices=False)
             row_leverage = torch.sum(self.U ** 2, dim=1)
 
         # row_leverage is on self.device (GPU); config_idxs_train may be on CPU

@@ -32,24 +32,23 @@ class CookSubSampler(RandomSubSampler):
                  update_method='auto',        # 'woodbury', 'qr', or 'auto'
                  tree_reduction_threshold=10,
                  local_devices=None,
-                 train_target_device=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None,
                  ):
 
         self.n_chunks = n_chunks
-        # Keep training data on CPU in chunked/distributed so the full X
-        # never lands on one GPU.
-        if train_target_device is None and (n_chunks is not None or linalg.is_distributed()):
-            train_target_device = 'cpu'
 
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed,
                          test_mask=test_mask, config_idxs=config_idxs,
                          enrow_mask=enrow_mask, intercept=intercept, device=device,
                          local_devices=local_devices,
-                         train_target_device=train_target_device,
                          partitioned_override=partitioned_override,
                          unique_config_idxs_train_override=unique_config_idxs_train_override)
+
+        # TEMP (Stage 2): stepwise/block/one-step Cook's still operate on a
+        # materialized X_train/X_test (kept on CPU); build them from the row
+        # indices. Stage 2 converts these paths to index streaming.
+        self._materialize_train_X(target='cpu')
 
         self.block = block
         self.stepwise = stepwise
@@ -130,6 +129,9 @@ class CookSubSampler(RandomSubSampler):
         self.w_train = self.w_train[sort_perm]
         self.enrow_mask_train = self.enrow_mask_train[sort_perm]
         self.config_idxs_train = self.config_idxs_train[sort_perm]
+        # Keep the row-index map aligned with the reordered train siblings so
+        # index streaming (errors/subsample) gathers the right rows of self.X.
+        self.train_idx = self.train_idx[sort_perm.to(self.train_idx.device)]
 
         unique_vals, counts = torch.unique_consecutive(self.config_idxs_train, return_counts=True)
         end_indices = torch.cumsum(counts, dim=0)
@@ -168,21 +170,28 @@ class CookSubSampler(RandomSubSampler):
                 "One-step Cook's does not support chunked/distributed mode. "
                 "Use stepwise=True for chunked operation.")
 
+        # X_train/y_train are weighted in place by _create_sub_mask; gather the
+        # weighted training rows (and energy mask) to the device for the single
+        # SVD. The host design matrix is never SVD'd in place.
+        Xtr = self.X_train.to(self.device)
+        ytr = self.y_train.to(self.device)
+        enrow = self.enrow_mask_train.to(self.device)
+
         if self.U is None:
-            self.U, self.S, self.Vh = torch.linalg.svd(self.X_train, full_matrices=False)
+            self.U, self.S, self.Vh = torch.linalg.svd(Xtr, full_matrices=False)
 
-        leverage_scores = torch.sum(self.U[self.enrow_mask_train] ** 2, dim=1)
+        leverage_scores = torch.sum(self.U[enrow] ** 2, dim=1)
 
-        tol = torch.finfo(self.X_train.dtype).eps * max(self.X_train.shape) * self.S[0]
+        tol = torch.finfo(self.dtype).eps * max(Xtr.shape) * self.S[0]
         S_inv = torch.where(self.S > tol, 1 / self.S,
                             torch.tensor(0.0, device=self.device, dtype=self.dtype))
 
-        term1 = self.U.T @ self.y_train
+        term1 = self.U.T @ ytr
         term2 = S_inv.reshape(-1, 1) * term1
         coeffs = self.Vh.T @ term2
 
-        preds = self.X_train[self.enrow_mask_train] @ coeffs
-        en_residuals_sq = torch.square(preds - self.y_train[self.enrow_mask_train]).reshape(-1)
+        preds = Xtr[enrow] @ coeffs
+        en_residuals_sq = torch.square(preds - ytr[enrow]).reshape(-1)
 
         self.onestep_en_cooks = en_residuals_sq * leverage_scores / (1 - leverage_scores) ** 2
 
@@ -195,7 +204,7 @@ class CookSubSampler(RandomSubSampler):
             sub_unique_config_idxs_train = self.unique_config_idxs_train.cpu()[indices]
         else:
             topk_vals, topk_indices = torch.topk(self.onestep_en_cooks, self.n_subsamples)
-            sub_unique_config_idxs_train = self.unique_config_idxs_train[topk_indices.cpu()]
+            sub_unique_config_idxs_train = self.unique_config_idxs_train.cpu()[topk_indices.cpu()]
 
         self.sub_mask = torch.isin(self.config_idxs, sub_unique_config_idxs_train.to(device='cpu'))
         self.sub_mask_train = torch.isin(
@@ -211,7 +220,6 @@ class CookSubSampler(RandomSubSampler):
         # config-id list via explicit kwargs, so every rank picks the same
         # configs. device=self.device keeps RNG consistent (torch.randperm
         # draws different sequences on CPU vs GPU for the same seed).
-        train_target = 'cpu' if self._needs_chunking() else None
         parent_partitioned = self._is_partitioned
         parent_global_cfg = (self.unique_config_idxs_train
                              if parent_partitioned else None)
@@ -224,7 +232,6 @@ class CookSubSampler(RandomSubSampler):
                 n_chunks=self.n_chunks,
                 factorization=self.factorization,
                 local_devices=self.local_devices,
-                train_target_device=train_target,
                 partitioned_override=parent_partitioned,
                 unique_config_idxs_train_override=parent_global_cfg)
         elif self.initial_subsampler == "random":
@@ -232,7 +239,6 @@ class CookSubSampler(RandomSubSampler):
                 self.X_train, seed=self.seed, device=self.device,
                 config_idxs=self.config_idxs_train, intercept=False,
                 local_devices=self.local_devices,
-                train_target_device=train_target,
                 partitioned_override=parent_partitioned,
                 unique_config_idxs_train_override=parent_global_cfg)
         else:
@@ -286,9 +292,12 @@ class CookSubSampler(RandomSubSampler):
             self.XTX_inv = linalg.xtx_inv_from_r(R, device=self.device)
             self.XTy = XTy.to(self.device)
         else:
-            # SVD path (single-process only)
-            self.XTX_inv, _, _, _ = linalg.xtx_inv_from_svd(sub_X, device=self.device)
-            self.XTy = sub_X.T @ sub_y
+            # SVD path (single-process only): the subset comes off the host
+            # X_train, so move it to the device for the dense SVD.
+            sub_X_dev = sub_X.to(self.device)
+            sub_y_dev = sub_y.to(self.device)
+            self.XTX_inv, _, _, _ = linalg.xtx_inv_from_svd(sub_X_dev, device=self.device)
+            self.XTy = sub_X_dev.T @ sub_y_dev
 
         # 3. Data stays on its current device (CPU in chunked mode, GPU otherwise).
         # The stepwise loop moves only the needed rows to GPU per iteration.
