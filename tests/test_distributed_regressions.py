@@ -132,9 +132,12 @@ def test_tsqr_replicated_distributed_raises(tmp_path):
 # C3: Cook's _create_sub_mask must not leave X_train weighted on exception
 # ---------------------------------------------------------------------------
 
-def test_cooks_exception_safety_restores_unweighted_xtrain(mini_dataset):
-    """If an exception is raised inside the stepwise compute, X_train and
-    y_train must be restored to unweighted state."""
+def test_cooks_never_mutates_host_design_matrix(mini_dataset):
+    """Cook's must never weight/mutate the shared host design matrix in place
+    (it weights per gather instead). Previously it multiplied X_train by w in
+    place and relied on a try/finally restore; the index model removes that
+    entirely, so self.X must be byte-identical before and after sampling, even
+    if the stepwise compute raises."""
     d = mini_dataset
     css = CookSubSampler(d["X"], y=d["y"], w=d["w"],
                          config_idxs=d["config_idxs"],
@@ -143,7 +146,7 @@ def test_cooks_exception_safety_restores_unweighted_xtrain(mini_dataset):
                          test_fraction=0.5, seed=41,
                          factorization="svd")
 
-    X_train_before = css.X_train.clone()
+    X_before = css.X.clone()
     y_train_before = css.y_train.clone()
 
     # Force an exception inside _stepwise_cooks_sampling
@@ -154,10 +157,8 @@ def test_cooks_exception_safety_restores_unweighted_xtrain(mini_dataset):
     with pytest.raises(RuntimeError, match="intentional"):
         css.create_subsample(subsample_fraction=0.5, seed=42)
 
-    assert torch.allclose(css.X_train, X_train_before), (
-        "BUG C3: X_train left weighted after exception")
-    assert torch.allclose(css.y_train, y_train_before), (
-        "BUG C3: y_train left weighted after exception")
+    assert torch.equal(css.X, X_before), "Cook's mutated the host design matrix"
+    assert torch.equal(css.y_train, y_train_before), "Cook's mutated y_train"
 
 
 # ---------------------------------------------------------------------------
@@ -265,9 +266,9 @@ def test_compute_nonblock_cooks_sentinel_when_no_energy_rows(mini_dataset):
                          factorization="svd")
     # Drive enrow_mask_train to all-False locally
     css.enrow_mask_train = torch.zeros_like(css.enrow_mask_train)
-    css.XTX_inv = torch.eye(css.X_train.shape[1], device=css.device,
+    css.XTX_inv = torch.eye(css.X.shape[1], device=css.device,
                             dtype=css.dtype)
-    coeffs = torch.zeros((css.X_train.shape[1], 1), device=css.device,
+    coeffs = torch.zeros((css.X.shape[1], 1), device=css.device,
                          dtype=css.dtype)
     val, cid = css._compute_nonblock_cooks(coeffs)
     assert val == -float("inf")

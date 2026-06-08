@@ -6,7 +6,8 @@ from subdatapy import linalg
 
 class LeverageSubSampler(RandomSubSampler):
 
-    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, config_idxs=None,
+    def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None,
+                 config_idxs=None,
                  enrow_mask=None, intercept=True, device='cuda', block=False,
                  U=None, S=None, Vh=None,
                  factorization='auto',   # 'svd', 'qr', or 'auto'
@@ -16,6 +17,7 @@ class LeverageSubSampler(RandomSubSampler):
                  unique_config_idxs_train_override=None,
                  ):
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed,
+                         test_mask=test_mask,
                          config_idxs=config_idxs, enrow_mask=enrow_mask,
                          intercept=intercept, device=device,
                          local_devices=local_devices,

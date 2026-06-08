@@ -4,6 +4,7 @@ import warnings
 from .random import RandomSubSampler
 from .leverage import LeverageSubSampler
 from subdatapy import linalg
+from subdatapy import partition as _partition
 
 
 def _batched_matmul(A, B):
@@ -44,11 +45,6 @@ class CookSubSampler(RandomSubSampler):
                          local_devices=local_devices,
                          partitioned_override=partitioned_override,
                          unique_config_idxs_train_override=unique_config_idxs_train_override)
-
-        # TEMP (Stage 2): stepwise/block/one-step Cook's still operate on a
-        # materialized X_train/X_test (kept on CPU); build them from the row
-        # indices. Stage 2 converts these paths to index streaming.
-        self._materialize_train_X(target='cpu')
 
         self.block = block
         self.stepwise = stepwise
@@ -100,22 +96,22 @@ class CookSubSampler(RandomSubSampler):
     def _needs_chunking(self):
         return self.n_chunks is not None or linalg.is_distributed()
 
-    def _move_train_to_cpu(self):
-        """Move training data to CPU for chunked processing."""
-        self.X_train = self.X_train.to('cpu')
-        self.y_train = self.y_train.to('cpu')
-        self.w_train = self.w_train.to('cpu')
-        self.config_idxs_train = self.config_idxs_train.to('cpu')
-        self.enrow_mask_train = self.enrow_mask_train.to('cpu')
+    def _train_rows(self, sel):
+        """Weighted (design, target) training rows selected by ``sel`` (a bool
+        mask, slice, or index over the train rows), gathered onto self.device.
 
-    def _move_train_to_device(self):
-        """Move training data back to GPU after chunked processing."""
-        self.X_train = self.X_train.to(self.device)
-        self.y_train = self.y_train.to(self.device)
-        self.w_train = self.w_train.to(self.device)
-        self.config_idxs_train = self.config_idxs_train.to(self.device)
-        self.enrow_mask_train = self.enrow_mask_train.to(self.device)
-        self.sub_mask_train = self.sub_mask_train.to(self.device)
+        Replaces the old materialized + in-place-weighted ``self.X_train[sel]``
+        / ``self.y_train[sel]``: rows are gathered from the host ``self.X`` by
+        their global index and weighted here (per call), so the design matrix
+        is never copied or mutated.
+        """
+        if torch.is_tensor(sel):
+            sel = sel.cpu()
+        gi = self.train_idx[sel]
+        wsel = self.w_train[sel].reshape(-1, 1)
+        Xw = (self.X[gi] * wsel).to(self.device)
+        yw = (self.y_train[sel].reshape(-1, 1) * wsel).to(self.device)
+        return Xw, yw
 
     # ------------------------------------------------------------------
     # Block metadata (identical in old cooks.py and mpi_cooks.py)
@@ -124,13 +120,13 @@ class CookSubSampler(RandomSubSampler):
     def _prepare_block_metadata(self):
         sort_perm = torch.argsort(self.config_idxs_train)
 
-        self.X_train = self.X_train[sort_perm]
+        # Reorder the per-row train siblings and the row-index map by config so
+        # group_metadata can slice contiguous [start:start+count] ranges. The
+        # design matrix is never reordered — train_idx points back into self.X.
         self.y_train = self.y_train[sort_perm]
         self.w_train = self.w_train[sort_perm]
         self.enrow_mask_train = self.enrow_mask_train[sort_perm]
         self.config_idxs_train = self.config_idxs_train[sort_perm]
-        # Keep the row-index map aligned with the reordered train siblings so
-        # index streaming (errors/subsample) gathers the right rows of self.X.
         self.train_idx = self.train_idx[sort_perm.to(self.train_idx.device)]
 
         unique_vals, counts = torch.unique_consecutive(self.config_idxs_train, return_counts=True)
@@ -147,16 +143,12 @@ class CookSubSampler(RandomSubSampler):
     # ------------------------------------------------------------------
 
     def _create_sub_mask(self):
-        self.X_train.mul_(self.w_train)
-        self.y_train.mul_(self.w_train)
-        try:
-            if self.stepwise:
-                self._stepwise_cooks_sampling()
-            else:
-                self._onestep_cooks_sampling()
-        finally:
-            self.X_train.div_(self.w_train)
-            self.y_train.div_(self.w_train)
+        # Weighting is applied per gather inside the methods below (see
+        # _train_rows), so the host design matrix is never weighted in place.
+        if self.stepwise:
+            self._stepwise_cooks_sampling()
+        else:
+            self._onestep_cooks_sampling()
 
     # ------------------------------------------------------------------
     # One-step Cook's (unchanged from original — SVD only, single GPU)
@@ -177,11 +169,9 @@ class CookSubSampler(RandomSubSampler):
             self._onestep_cooks_svd()
 
     def _onestep_cooks_svd(self):
-        # Single-pass OLS/WLS leverage from the SVD. X_train/y_train are
-        # weighted in place by _create_sub_mask; gather them to the device for
-        # the dense SVD (the host design matrix is never SVD'd in place).
-        Xtr = self.X_train.to(self.device)
-        ytr = self.y_train.to(self.device)
+        # Single-pass WLS leverage from the SVD. Gather the weighted training
+        # rows onto the device (the host design matrix is never SVD'd in place).
+        Xtr, ytr = self._train_rows(slice(None))
         enrow = self.enrow_mask_train.to(self.device)
 
         if self.U is None:
@@ -213,10 +203,11 @@ class CookSubSampler(RandomSubSampler):
         # partitioned-distributed.
         distributed = linalg.is_distributed()
         rank = linalg.get_rank()
-        p = self.X_train.shape[1]
+        p = self.X.shape[1]
 
         R, XTy = linalg.tsqr_r_xty(
-            self.X_train, self.y_train, device=self.device, n_chunks=self.n_chunks,
+            self.X, self.y_train, x_idx=self.train_idx, w=self.w_train,
+            device=self.device, n_chunks=self.n_chunks,
             tree_reduction_threshold=self.tree_reduction_threshold,
             partitioned=self._is_partitioned, local_devices=self.local_devices)
         if distributed:
@@ -229,8 +220,7 @@ class CookSubSampler(RandomSubSampler):
         # Energy rows only (one per config) — small, gather to the device.
         en = self.enrow_mask_train
         if int(en.sum()) > 0:
-            Xen = self.X_train[en].to(self.device)
-            yen = self.y_train[en].to(self.device)
+            Xen, yen = self._train_rows(en)
             h = linalg.leverage_scores_from_r(Xen, R, device=self.device).reshape(-1)
             e = (Xen @ coeffs - yen).reshape(-1)
             cooks = (e ** 2 * h / (1 - h) ** 2).cpu()
@@ -271,41 +261,45 @@ class CookSubSampler(RandomSubSampler):
     # ------------------------------------------------------------------
 
     def _create_initial_sub_mask(self):
-        # Nested samplers inherit the parent's partition state and global
-        # config-id list via explicit kwargs, so every rank picks the same
-        # configs. device=self.device keeps RNG consistent (torch.randperm
-        # draws different sequences on CPU vs GPU for the same seed).
+        # Pick the initial config set, then rebuild the masks via isin so they
+        # are correct regardless of row order (block sort) and partitioning.
         parent_partitioned = self._is_partitioned
         parent_global_cfg = (self.unique_config_idxs_train
                              if parent_partitioned else None)
 
-        if self.initial_subsampler == "leverage":
+        if self.initial_subsampler == "random":
+            # Random config pick over the (global) train configs — needs no X.
+            # Matches RandomSubSampler.create_subsample's CPU-RNG selection.
+            if self.seed is not None:
+                torch.manual_seed(self.seed)
+            n_total = len(self.unique_config_idxs_train)
+            n_init = round(n_total * self.initial_subsample_fraction)
+            perm = torch.randperm(n_total)
+            chosen = self.unique_config_idxs_train.cpu()[perm[:n_init]]
+        elif self.initial_subsampler == "leverage":
+            # Leverage over the parent's TRAIN rows, sharing self.X by reference
+            # (test_mask marks the non-train rows) — no design-matrix copy.
             inner = LeverageSubSampler(
-                self.X_train, seed=self.seed, device=self.device,
-                config_idxs=self.config_idxs_train, block=self.block,
-                intercept=False,
-                n_chunks=self.n_chunks,
-                factorization=self.factorization,
+                self.X, w=self.w, seed=self.seed, device=self.device,
+                config_idxs=self.config_idxs, enrow_mask=self.enrow_mask,
+                test_mask=self.test_mask, block=self.block, intercept=False,
+                n_chunks=self.n_chunks, factorization=self.factorization,
                 local_devices=self.local_devices,
                 partitioned_override=parent_partitioned,
                 unique_config_idxs_train_override=parent_global_cfg)
-        elif self.initial_subsampler == "random":
-            inner = RandomSubSampler(
-                self.X_train, seed=self.seed, device=self.device,
-                config_idxs=self.config_idxs_train, intercept=False,
-                local_devices=self.local_devices,
-                partitioned_override=parent_partitioned,
-                unique_config_idxs_train_override=parent_global_cfg)
+            inner.create_subsample(
+                subsample_fraction=self.initial_subsample_fraction, seed=self.seed)
+            local_chosen = torch.unique(self.config_idxs[inner.sub_mask.cpu()])
+            chosen = (_partition.build_global_config_ids(local_chosen)
+                      if parent_partitioned else local_chosen)
         else:
             raise ValueError(
                 f"Unknown initial_subsampler {self.initial_subsampler!r}")
 
-        self.sub_mask_train = inner.create_subsample(
-            subsample_fraction=self.initial_subsample_fraction, seed=self.seed
-        ).to(device=self.config_idxs_train.device)
-
-        self.sub_mask = torch.isin(
-            self.config_idxs.cpu(), self.config_idxs_train[self.sub_mask_train].cpu())
+        chosen = chosen.cpu()
+        self.sub_mask = torch.isin(self.config_idxs, chosen)
+        self.sub_mask_train = torch.isin(
+            self.config_idxs_train, chosen.to(self.config_idxs_train.device))
 
     # ------------------------------------------------------------------
     # Stepwise Cook's — merged logic from cooks.py + mpi_cooks.py
@@ -320,13 +314,17 @@ class CookSubSampler(RandomSubSampler):
         if self.sub_mask is None:
             self._create_initial_sub_mask()
 
-        sub_X = self.X_train[self.sub_mask_train]
-        sub_y = self.y_train[self.sub_mask_train]
+        # Subsample rows (indices into the host X) and their weights/targets.
+        sm = self.sub_mask_train.cpu()
+        sub_idx = self.train_idx[sm]
+        sub_w = self.w_train[sm]
+        sub_y = self.y_train[sm]
+        p = self.X.shape[1]
 
         # 2. Initial factorization
         if self._use_qr_factorization():
             R, XTy = linalg.tsqr_r_xty(
-                sub_X, sub_y,
+                self.X, sub_y, x_idx=sub_idx, w=sub_w,
                 device=self.device,
                 n_chunks=self.n_chunks,
                 tree_reduction_threshold=self.tree_reduction_threshold,
@@ -335,24 +333,22 @@ class CookSubSampler(RandomSubSampler):
             )
             # Broadcast R and XTy so every rank has identical state for the
             # greedy update loop.
-            p = sub_X.shape[1]
             if distributed:
                 R = linalg.broadcast_tensor(
                     R if rank == 0 else None, src=0,
-                    shape=(p, p), dtype=sub_X.dtype, device=self.device)
+                    shape=(p, p), dtype=self.dtype, device=self.device)
                 XTy = linalg.broadcast_tensor(
                     XTy if rank == 0 else None, src=0,
-                    shape=(p, 1), dtype=sub_X.dtype, device=self.device)
+                    shape=(p, 1), dtype=self.dtype, device=self.device)
             self.R_final = R
             self.XTX_inv = linalg.xtx_inv_from_r(R, device=self.device)
             self.XTy = XTy.to(self.device)
         else:
-            # SVD path (single-process only): the subset comes off the host
-            # X_train, so move it to the device for the dense SVD.
-            sub_X_dev = sub_X.to(self.device)
-            sub_y_dev = sub_y.to(self.device)
-            self.XTX_inv, _, _, _ = linalg.xtx_inv_from_svd(sub_X_dev, device=self.device)
-            self.XTy = sub_X_dev.T @ sub_y_dev
+            # SVD path (single-process only): gather the weighted subset onto
+            # the device for the dense SVD.
+            Xw, yw = self._train_rows(self.sub_mask_train)
+            self.XTX_inv, _, _, _ = linalg.xtx_inv_from_svd(Xw, device=self.device)
+            self.XTy = Xw.T @ yw
 
         # 3. Data stays on its current device (CPU in chunked mode, GPU otherwise).
         # The stepwise loop moves only the needed rows to GPU per iteration.
@@ -401,15 +397,14 @@ class CookSubSampler(RandomSubSampler):
             # Owner broadcasts X_change, y_change so all ranks apply the same update.
             if distributed:
                 if rank == owner_rank:
-                    X_change_local = self.X_train[change_mask].to(self.device)
-                    y_change_local = self.y_train[change_mask].to(self.device)
+                    X_change_local, y_change_local = self._train_rows(change_mask)
                     n_change = torch.tensor([X_change_local.shape[0]],
                                             dtype=torch.int64, device=self.device)
                 else:
+                    X_change_local = y_change_local = None
                     n_change = torch.tensor([0], dtype=torch.int64, device=self.device)
                 dist.broadcast(n_change, src=owner_rank)
                 n = int(n_change.item())
-                p = self.X_train.shape[1]
                 X_change = linalg.broadcast_tensor(
                     X_change_local if rank == owner_rank else None, src=owner_rank,
                     shape=(n, p), dtype=self.dtype, device=self.device)
@@ -417,8 +412,7 @@ class CookSubSampler(RandomSubSampler):
                     y_change_local if rank == owner_rank else None, src=owner_rank,
                     shape=(n, 1), dtype=self.dtype, device=self.device)
             else:
-                X_change = self.X_train[change_mask].to(self.device)
-                y_change = self.y_train[change_mask].to(self.device)
+                X_change, y_change = self._train_rows(change_mask)
 
             if self._use_qr_update():
                 self.R_final, self.XTX_inv, self.XTy = linalg.qr_update_add(
@@ -458,17 +452,22 @@ class CookSubSampler(RandomSubSampler):
                 batch_meta = self.group_metadata[batch_start:batch_end]
                 curr_batch_size = batch_meta.shape[0]
                 batch_max_len = batch_meta[-1, 2].item()
-                n_features = self.X_train.shape[1]
+                n_features = self.X.shape[1]
 
-                # Build padded batch on CPU then transfer
+                # Build padded batch on CPU then transfer. Rows are gathered
+                # from the host X by their (config-sorted) global index and
+                # weighted here — the design matrix is never copied/weighted
+                # in place.
                 X_batch_cpu = torch.zeros((curr_batch_size, batch_max_len, n_features), dtype=self.dtype)
                 y_batch_cpu = torch.zeros((curr_batch_size, batch_max_len, 1), dtype=self.dtype)
 
                 for b_i in range(curr_batch_size):
                     _, start, count = batch_meta[b_i]
                     start, count = int(start), int(count)
-                    X_batch_cpu[b_i, :count] = self.X_train[start:start + count]
-                    y_batch_cpu[b_i, :count] = self.y_train[start:start + count]
+                    gi = self.train_idx[start:start + count]
+                    wsel = self.w_train[start:start + count].reshape(-1, 1)
+                    X_batch_cpu[b_i, :count] = self.X[gi] * wsel
+                    y_batch_cpu[b_i, :count] = self.y_train[start:start + count].reshape(-1, 1) * wsel
 
                 X_batch = X_batch_cpu.to(self.device)
                 y_batch = y_batch_cpu.to(self.device)
@@ -530,8 +529,7 @@ class CookSubSampler(RandomSubSampler):
             if self.enrow_mask_train.sum().item() == 0:
                 return (-float('inf') if self.ascending else float('inf')), -1
 
-            X_en = self.X_train[self.enrow_mask_train].to(self.device)
-            y_en = self.y_train[self.enrow_mask_train].to(self.device)
+            X_en, y_en = self._train_rows(self.enrow_mask_train)
 
             en_residuals = X_en @ coeffs - y_en
             leverage_scores = torch.sum((X_en @ self.XTX_inv) * X_en, dim=1)

@@ -258,14 +258,6 @@ class BaseData:
             self.unique_config_idxs_train = self._unique_config_idxs_train_override.to(self.device)
 
 
-    def _materialize_train_X(self, target='cpu'):
-        """TEMP (Stage 2): build X_train/X_test from the row indices for paths
-        not yet converted to index streaming (stepwise/block/one-step Cook's).
-        Reintroduces the per-split design-matrix copy for those paths only; the
-        row-scale siblings stay on CPU per the device rule."""
-        self.X_train = self.X[self.train_idx].to(target)
-        self.X_test = self.X[self.test_idx].to(target)
-
     def train(self, method='auto', n_chunks=None):
         """Weighted Least Squares training.
 
