@@ -66,6 +66,7 @@ def test_partitioned_loader_keeps_design_matrix_on_cpu(tmp_path):
         bd = BaseData.__new__(BaseData)
         bd.device = "cpu"
         bd.dtype = torch.float64
+        bd.storage_dtype = torch.float64
         bd.coeffs = None
         bd.local_devices = ["cpu"]
         bd._is_partitioned = True

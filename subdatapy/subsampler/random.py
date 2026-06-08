@@ -9,13 +9,13 @@ from subdatapy import linalg
 class RandomSubSampler(BaseData):
 
     def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None, config_idxs=None,
-                 enrow_mask=None, intercept=True, device='cuda',
+                 enrow_mask=None, intercept=True, device='cuda', dtype=torch.float64,
                  local_devices=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None):
         super().__init__(
             X, y=y, w=w, config_idxs=config_idxs, enrow_mask=enrow_mask,
-            intercept=intercept, device=device, local_devices=local_devices,
+            intercept=intercept, device=device, dtype=dtype, local_devices=local_devices,
             partitioned_override=partitioned_override,
             unique_config_idxs_train_override=unique_config_idxs_train_override,
         )

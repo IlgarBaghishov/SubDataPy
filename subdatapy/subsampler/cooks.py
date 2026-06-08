@@ -24,7 +24,7 @@ class CookSubSampler(RandomSubSampler):
 
     def __init__(self, X, y, w=None, test_fraction=0.0, seed=None, test_mask=None,
                  config_idxs=None, enrow_mask=None, intercept=True,
-                 device='cuda', block=False, stepwise=False, sampling=True,
+                 device='cuda', dtype=torch.float64, block=False, stepwise=False, sampling=True,
                  ascending=True, initial_subsampler="random",
                  initial_subsample_fraction=1, U=None, S=None, Vh=None,
                  # Chunked / distributed parameters:
@@ -42,7 +42,7 @@ class CookSubSampler(RandomSubSampler):
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed,
                          test_mask=test_mask, config_idxs=config_idxs,
                          enrow_mask=enrow_mask, intercept=intercept, device=device,
-                         local_devices=local_devices,
+                         dtype=dtype, local_devices=local_devices,
                          partitioned_override=partitioned_override,
                          unique_config_idxs_train_override=unique_config_idxs_train_override)
 
@@ -295,6 +295,7 @@ class CookSubSampler(RandomSubSampler):
             # (test_mask marks the non-train rows) — no design-matrix copy.
             inner = LeverageSubSampler(
                 self.X, w=self.w, seed=self.seed, device=self.device,
+                dtype=self.storage_dtype,
                 config_idxs=self.config_idxs, enrow_mask=self.enrow_mask,
                 test_mask=self.test_mask, block=self.block, intercept=False,
                 n_chunks=self.n_chunks, factorization=self.factorization,

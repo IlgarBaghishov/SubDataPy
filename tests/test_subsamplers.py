@@ -2,7 +2,41 @@ import pytest
 import torch
 import numpy as np
 import pandas as pd
+from subdatapy.data import BaseData
 from subdatapy.subsampler import RandomSubSampler, LeverageSubSampler, CookSubSampler
+
+
+def test_float32_storage_matches_float64_well_conditioned():
+    """dtype=torch.float32 stores X in float32 (half the memory) but keeps all
+    factors in float64; on well-conditioned data the coefficients match the
+    float64 run to ~1e-5, and the default (float64) is unchanged."""
+    rng = np.random.default_rng(0)
+    n, p, rpc = 2000, 12, 5
+    X = np.hstack([np.ones((n, 1)), rng.standard_normal((n, p - 1))])  # well conditioned
+    true = rng.standard_normal((p, 1))
+    y = (X @ true + 1e-3 * rng.standard_normal((n, 1))).reshape(-1)
+    cfg = np.repeat(np.arange(n // rpc), rpc).astype(np.int64)
+    erm = np.zeros(n, bool); erm[::rpc] = True
+
+    out = {}
+    for dt in (torch.float64, torch.float32):
+        bd = BaseData(X, y=y, config_idxs=cfg, enrow_mask=erm, intercept=False,
+                      device="cpu", dtype=dt)
+        bd.train_test_split(test_fraction=0.3, seed=41)
+        bd.train(method="auto")
+        out[dt] = bd
+
+    assert out[torch.float32].X.dtype == torch.float32       # X stored in float32
+    assert out[torch.float64].X.dtype == torch.float64
+    assert out[torch.float32].coeffs.dtype == torch.float64  # factors stay float64
+    rel = (torch.norm(out[torch.float64].coeffs - out[torch.float32].coeffs)
+           / torch.norm(out[torch.float64].coeffs)).item()
+    assert rel < 1e-5, f"float32 coeffs diverged on well-conditioned data: {rel:.2e}"
+
+
+def test_invalid_dtype_rejected():
+    with pytest.raises(ValueError, match="float32 or torch.float64"):
+        BaseData(np.ones((4, 2)), device="cpu", dtype=torch.int32)
 
 
 def check_dataframe_results(df, expected_error=None, subsampler_name=None, column_name="Testing Energy RMSE"):

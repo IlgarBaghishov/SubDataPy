@@ -103,8 +103,9 @@ def solve_wls(X, y, w, *, x_idx=None, method='auto', device, n_chunks,
         return coeffs
 
     if method == 'lstsq':
-        # Single-pass: gather the selected rows onto the device, weight there.
-        Xg = (X[x_idx] if x_idx is not None else X).to(device)
+        # Single-pass: gather the selected rows onto the device (cast up to
+        # float64 — X may be stored in float32), weight there.
+        Xg = (X[x_idx] if x_idx is not None else X).to(device).to(torch.float64)
         B = y.to(device).reshape(-1, 1)
         if w is not None:
             wv = w.to(device).reshape(-1, 1)
@@ -285,7 +286,10 @@ def _tsqr_core(X, *, y=None, x_idx=None, w=None, device='cuda', n_chunks=None,
     world_size = get_world_size()
     rank = get_rank()
     n_features = X.shape[1]
-    dtype = X.dtype
+    # Compute in float64 even when X is stored in float32: each chunk is cast
+    # up on the device (the cast is exact and cheap; the transfer stays at the
+    # storage dtype). Factors/accumulators are always float64.
+    dtype = torch.float64
 
     if local_devices is None or len(local_devices) == 0:
         local_devices = [device]
@@ -308,7 +312,7 @@ def _tsqr_core(X, *, y=None, x_idx=None, w=None, device='cuda', n_chunks=None,
     # --- Mode 1: single-pass (single process, single device, no chunks) ---
     if n_chunks is None and not partitioned and n_local_gpus == 1:
         with torch.no_grad():
-            X_dev = (X[x_idx] if x_idx is not None else X).to(device)
+            X_dev = (X[x_idx] if x_idx is not None else X).to(device).to(dtype)
             if w is not None:
                 X_dev = X_dev * w.to(device).reshape(-1, 1)
             with _cusolver_backend():
@@ -343,9 +347,9 @@ def _tsqr_core(X, *, y=None, x_idx=None, w=None, device='cuda', n_chunks=None,
         gpu = local_devices[ci % n_local_gpus]
         with torch.no_grad():
             if x_idx is not None:
-                X_chunk = X[x_idx[start:end]].to(gpu)
+                X_chunk = X[x_idx[start:end]].to(gpu).to(dtype)
             else:
-                X_chunk = X[start:end].to(gpu)
+                X_chunk = X[start:end].to(gpu).to(dtype)
             wc = None
             if w is not None:
                 wc = w[start:end].to(gpu).reshape(-1, 1)
@@ -511,7 +515,7 @@ def leverage_scores_from_qr(X, *, device='cuda'):
     Returns:
         h: (n,) leverage scores on device
     """
-    X_dev = X.to(device)
+    X_dev = X.to(device).to(torch.float64)
     with torch.no_grad():
         with _cusolver_backend():
             Q, _ = torch.linalg.qr(X_dev, mode='reduced')
@@ -547,10 +551,12 @@ def leverage_scores_from_r(X, R, *, x_idx=None, w=None, device='cuda',
     n_local_gpus = len(local_devices)
 
     n = x_idx.shape[0] if x_idx is not None else X.shape[0]
+    # Leverage is computed in float64 even when X is stored in float32.
+    cdtype = torch.float64
 
     if (n_chunks is None or n_chunks <= 1) and n_local_gpus == 1:
-        R_dev = R.to(device)
-        X_dev = (X[x_idx] if x_idx is not None else X).to(device)
+        R_dev = R.to(device).to(cdtype)
+        X_dev = (X[x_idx] if x_idx is not None else X).to(device).to(cdtype)
         if w is not None:
             X_dev = X_dev * w.to(device).reshape(-1, 1)
         B = torch.linalg.solve_triangular(R_dev.T, X_dev.T, upper=False).T
@@ -561,9 +567,9 @@ def leverage_scores_from_r(X, R, *, x_idx=None, w=None, device='cuda',
     total_chunks = per_rank_chunks * n_local_gpus
     chunk_size = (n + total_chunks - 1) // total_chunks if n > 0 else 0
     # Pre-place R on each local GPU once
-    R_by_gpu = {g: R.to(g) for g in local_devices}
+    R_by_gpu = {g: R.to(g).to(cdtype) for g in local_devices}
 
-    h = torch.empty(n, device=device, dtype=X.dtype)
+    h = torch.empty(n, device=device, dtype=cdtype)
     with torch.no_grad():
         for ci in range(total_chunks):
             start = ci * chunk_size
@@ -572,9 +578,9 @@ def leverage_scores_from_r(X, R, *, x_idx=None, w=None, device='cuda',
                 break
             gpu = local_devices[ci % n_local_gpus]
             if x_idx is not None:
-                X_chunk = X[x_idx[start:end]].to(gpu)
+                X_chunk = X[x_idx[start:end]].to(gpu).to(cdtype)
             else:
-                X_chunk = X[start:end].to(gpu)
+                X_chunk = X[start:end].to(gpu).to(cdtype)
             if w is not None:
                 X_chunk = X_chunk * w[start:end].to(gpu).reshape(-1, 1)
             B_chunk = torch.linalg.solve_triangular(
@@ -619,15 +625,18 @@ def chunked_sq_residuals(X, y, coeffs, *, x_idx=None, device='cuda',
     n_local_gpus = len(local_devices)
     n = x_idx.shape[0] if x_idx is not None else X.shape[0]
     out_device = X.device
-    coeffs = coeffs.reshape(-1, 1)
+    # Residuals (and their squares) are computed/accumulated in float64 even
+    # when X is stored in float32 — each chunk is cast up on the device.
+    cdtype = torch.float64
+    coeffs = coeffs.reshape(-1, 1).to(cdtype)
 
     if n == 0:
-        return torch.empty((0, 1), dtype=X.dtype, device=out_device)
+        return torch.empty((0, 1), dtype=cdtype, device=out_device)
 
     # Single-pass when there is nothing to chunk across.
     if (n_chunks is None or n_chunks <= 1) and n_local_gpus == 1:
         with torch.no_grad():
-            X_sel = (X[x_idx] if x_idx is not None else X).to(device)
+            X_sel = (X[x_idx] if x_idx is not None else X).to(device).to(cdtype)
             r = X_sel @ coeffs.to(device) - y.to(device).reshape(-1, 1)
             return (r * r).to(out_device)
 
@@ -636,7 +645,7 @@ def chunked_sq_residuals(X, y, coeffs, *, x_idx=None, device='cuda',
     chunk_size = (n + total_chunks - 1) // total_chunks
     coeffs_by_gpu = {g: coeffs.to(g) for g in local_devices}
 
-    out = torch.empty((n, 1), dtype=X.dtype, device=out_device)
+    out = torch.empty((n, 1), dtype=cdtype, device=out_device)
     with torch.no_grad():
         for ci in range(total_chunks):
             start = ci * chunk_size
@@ -645,9 +654,9 @@ def chunked_sq_residuals(X, y, coeffs, *, x_idx=None, device='cuda',
                 break
             gpu = local_devices[ci % n_local_gpus]
             if x_idx is not None:
-                X_chunk = X[x_idx[start:end]].to(gpu)
+                X_chunk = X[x_idx[start:end]].to(gpu).to(cdtype)
             else:
-                X_chunk = X[start:end].to(gpu)
+                X_chunk = X[start:end].to(gpu).to(cdtype)
             y_chunk = y[start:end].to(gpu).reshape(-1, 1)
             r = X_chunk @ coeffs_by_gpu[gpu] - y_chunk
             out[start:end] = (r * r).to(out_device)

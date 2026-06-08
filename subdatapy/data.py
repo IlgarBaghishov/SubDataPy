@@ -66,10 +66,20 @@ def process_data(x, dtype=torch.float64, device='cpu'):
 class BaseData:
 
     def __init__(self, X, y=None, w=None, config_idxs=None, enrow_mask=None,
-                 intercept=True, device='cuda', local_devices=None,
+                 intercept=True, device='cuda', dtype=torch.float64,
+                 local_devices=None,
                  partitioned_override=None,
                  unique_config_idxs_train_override=None):
         """Args:
+            dtype: STORAGE precision of the design matrix X (torch.float32 or
+                torch.float64; default float64). float32 halves X's host RAM,
+                the per-chunk gather buffer, and the H2D transfer. ALL linear
+                algebra still runs in float64 — each streamed chunk is cast up
+                to float64 on the device — so the only accuracy cost is that the
+                stored X values are quantized to ~7 digits (lossless if your
+                descriptors are already float32; for ill-conditioned X keep
+                float64). y, w, and every factor (R, XtX_inv, coeffs, leverage)
+                stay float64.
             partitioned_override: Force `_is_partitioned` to this value
                 instead of auto-detecting from (distributed AND file-path
                 inputs). Used by nested samplers in CookSubSampler to
@@ -86,8 +96,12 @@ class BaseData:
         train/test target switch — train_test_split keeps the design matrix on
         CPU and records row indices instead of copying out X_train/X_test.
         """
+        if dtype not in (torch.float32, torch.float64):
+            raise ValueError(
+                f"dtype must be torch.float32 or torch.float64, got {dtype!r}")
         self.device = device
-        self.dtype = torch.float64
+        self.dtype = torch.float64        # compute dtype: y, w, and all factors
+        self.storage_dtype = dtype        # storage dtype for the design matrix X
         self.coeffs = None
         self._unique_config_idxs_train_override = unique_config_idxs_train_override
 
@@ -112,10 +126,10 @@ class BaseData:
             self._load_partitioned(X, y, w, config_idxs, enrow_mask, intercept)
             return
 
-        self.X = process_data(X, self.dtype, 'cpu')
+        self.X = process_data(X, self.storage_dtype, 'cpu')
 
         if intercept:
-            ones = torch.ones((self.X.shape[0], 1), dtype=self.dtype).to(device='cpu')
+            ones = torch.ones((self.X.shape[0], 1), dtype=self.storage_dtype)
             self.X = torch.hstack((ones, self.X))
 
         self.y = process_data(y, self.dtype, 'cpu')
@@ -168,9 +182,9 @@ class BaseData:
         ranges = obj_list[0]
         start, end = ranges[rank]
 
-        self.X = _partition.mmap_load_partition(X_path, start, end, dtype=self.dtype)
+        self.X = _partition.mmap_load_partition(X_path, start, end, dtype=self.storage_dtype)
         if intercept:
-            ones = torch.ones((self.X.shape[0], 1), dtype=self.dtype)
+            ones = torch.ones((self.X.shape[0], 1), dtype=self.storage_dtype)
             self.X = torch.hstack((ones, self.X))
 
         self.y = (_partition.mmap_load_partition(y_path, start, end, dtype=self.dtype).reshape(-1, 1)

@@ -8,7 +8,7 @@ class LeverageSubSampler(RandomSubSampler):
 
     def __init__(self, X, y=None, w=None, test_fraction=0.0, seed=None, test_mask=None,
                  config_idxs=None,
-                 enrow_mask=None, intercept=True, device='cuda', block=False,
+                 enrow_mask=None, intercept=True, device='cuda', dtype=torch.float64, block=False,
                  U=None, S=None, Vh=None,
                  factorization='auto',   # 'svd', 'qr', or 'auto'
                  n_chunks=None,
@@ -19,7 +19,7 @@ class LeverageSubSampler(RandomSubSampler):
         super().__init__(X, y=y, w=w, test_fraction=test_fraction, seed=seed,
                          test_mask=test_mask,
                          config_idxs=config_idxs, enrow_mask=enrow_mask,
-                         intercept=intercept, device=device,
+                         intercept=intercept, device=device, dtype=dtype,
                          local_devices=local_devices,
                          partitioned_override=partitioned_override,
                          unique_config_idxs_train_override=unique_config_idxs_train_override)
