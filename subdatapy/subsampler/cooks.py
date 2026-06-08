@@ -81,6 +81,20 @@ class CookSubSampler(RandomSubSampler):
         return self._needs_chunking()
 
     def _use_qr_update(self):
+        # The QR update (qr_update_add) can only APPEND rows; it has no
+        # downdate. So descending (removing configs) must use Woodbury, whose
+        # rank-k formula handles removal (inv(I - X A^{-1} X^T)). Note: that
+        # removal inverse can be ill-conditioned when dropping a very
+        # high-leverage config, so descending is inherently a touch less
+        # robust than ascending (which can use the stabler QR update).
+        if not self.ascending:
+            if self.update_method == 'qr':
+                raise ValueError(
+                    "update_method='qr' cannot remove rows, so it does not "
+                    "support descending stepwise Cook's. Use "
+                    "update_method='woodbury' or 'auto' (which selects "
+                    "Woodbury for descending).")
+            return False
         if self.update_method == 'qr':
             if self.R_final is None:
                 raise ValueError(
@@ -89,8 +103,8 @@ class CookSubSampler(RandomSubSampler):
             return True
         if self.update_method == 'woodbury':
             return False
-        # 'auto': QR for block (stable), Woodbury for non-block (fast)
-        # QR update requires R_final from QR factorization
+        # 'auto' (ascending): QR for block (stable), Woodbury for non-block
+        # (fast). QR update requires R_final from QR factorization.
         return self.block and self.R_final is not None
 
     def _needs_chunking(self):

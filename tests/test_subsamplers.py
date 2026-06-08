@@ -97,6 +97,45 @@ def test_ascending_cooks_chunked_matches_unchunked(mini_dataset):
         assert v1 == pytest.approx(v2, rel=1e-6)
 
 
+@pytest.mark.parametrize("ascending", [True, False])
+@pytest.mark.parametrize("block", [True, False])
+def test_stepwise_cooks_incremental_inverse_matches_recompute(mini_dataset, ascending, block):
+    """The (X^T W^2 X)^{-1} maintained incrementally through the greedy
+    add/remove loop must match the inverse recomputed from scratch on the
+    final selected subset, for BOTH ascending (add; QR update for block,
+    Woodbury otherwise) and descending (remove; Woodbury only). The old
+    descending+block bug used the append-only QR update for removals, so its
+    inverse diverged from the real subset — this pins both directions."""
+    d = mini_dataset
+    css = CookSubSampler(X=d["X"], y=d["y"], w=d["w"], test_fraction=0.5, seed=41,
+                         config_idxs=d["config_idxs"], device=d["device"],
+                         stepwise=True, ascending=ascending, block=block,
+                         factorization="qr",
+                         initial_subsample_fraction=(0.1 if ascending else 1.0))
+    css.create_subsample(subsample_fraction=0.5, seed=42)
+
+    sm = css.sub_mask_train.cpu()
+    Xw = (css.X[css.train_idx[sm]] * css.w_train[sm].reshape(-1, 1)).to(css.device)
+    ref = torch.linalg.inv(Xw.T @ Xw)
+    rel = (torch.linalg.norm(css.XTX_inv - ref) / torch.linalg.norm(ref)).item()
+    assert rel < 1e-6, (
+        f"incremental XTX_inv diverged from recompute "
+        f"(ascending={ascending}, block={block}): relerr={rel:.2e}")
+
+
+def test_descending_cooks_rejects_explicit_qr_update(mini_dataset):
+    """The QR update can only append rows, so explicit update_method='qr' with
+    descending must raise rather than silently update in the wrong direction."""
+    d = mini_dataset
+    css = CookSubSampler(X=d["X"], y=d["y"], w=d["w"], test_fraction=0.5, seed=41,
+                         config_idxs=d["config_idxs"], device=d["device"],
+                         stepwise=True, ascending=False, block=True,
+                         factorization="qr", update_method="qr",
+                         initial_subsample_fraction=1.0)
+    with pytest.raises(ValueError, match="cannot remove rows"):
+        css.create_subsample(subsample_fraction=0.5, seed=42)
+
+
 def test_leverage_qr_matches_svd(mini_dataset):
     """LeverageSubSampler QR-based matches SVD-based leverage scores."""
     data = mini_dataset
