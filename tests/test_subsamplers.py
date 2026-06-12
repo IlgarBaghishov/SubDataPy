@@ -157,6 +157,31 @@ def test_stepwise_cooks_incremental_inverse_matches_recompute(mini_dataset, asce
         f"(ascending={ascending}, block={block}): relerr={rel:.2e}")
 
 
+def test_onestep_cooks_svd_qr_match_unordered_configs():
+    """One-step Cook's must select the same configs via SVD and QR even when
+    config ids are not sorted by row position (contiguous blocks, but
+    decreasing ids). The SVD path used to map scores to the sorted unique
+    config-id list, pairing each score with the wrong config for unordered
+    data; it now maps to the energy row's actual config id, like the QR path."""
+    rng = np.random.default_rng(0)
+    n_configs, rpc, p = 60, 6, 6
+    n = n_configs * rpc
+    X = np.hstack([np.ones((n, 1)), rng.standard_normal((n, p - 1))])
+    true = rng.standard_normal((p, 1))
+    y = (X @ true + 1e-2 * rng.standard_normal((n, 1))).reshape(-1)
+    cfg = np.repeat(np.arange(n_configs)[::-1], rpc).astype(np.int64)  # decreasing ids
+    erm = np.zeros(n, bool); erm[::rpc] = True
+    kw = dict(config_idxs=cfg, enrow_mask=erm, intercept=False, device="cpu",
+              test_fraction=0.3, seed=41, stepwise=False, sampling=False)
+
+    def sel(fact):
+        c = CookSubSampler(X, y=y, factorization=fact, **kw)
+        c.create_subsample(0.5, seed=42)
+        return sorted(c.config_idxs_train[c.sub_mask_train].unique().tolist())
+
+    assert sel("svd") == sel("qr")
+
+
 def test_descending_cooks_rejects_explicit_qr_update(mini_dataset):
     """The QR update can only append rows, so explicit update_method='qr' with
     descending must raise rather than silently update in the wrong direction."""

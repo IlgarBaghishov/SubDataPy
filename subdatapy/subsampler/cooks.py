@@ -205,10 +205,13 @@ class CookSubSampler(RandomSubSampler):
         en_residuals_sq = torch.square(preds - ytr[enrow]).reshape(-1)
         cooks = en_residuals_sq * leverage_scores / (1 - leverage_scores) ** 2
 
-        # Map cooks (energy-row order) back to config ids. Single-process only:
-        # energy rows are in config order, matching unique_config_idxs_train.
+        # Map each cooks score back to the actual config id of its energy row
+        # (same robust mapping as the QR path). Using unique_config_idxs_train
+        # here would assume config ids are sorted by row position and pick the
+        # wrong configs otherwise.
         self.onestep_en_cooks = cooks
-        self._onestep_select(cooks.cpu(), self.unique_config_idxs_train.cpu())
+        en_config_ids = self.config_idxs_train[self.enrow_mask_train].cpu()
+        self._onestep_select(cooks.cpu(), en_config_ids)
 
     def _onestep_cooks_qr(self):
         # TSQR leverage: R/X^T y from all (in-place weighted) train rows,
