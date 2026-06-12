@@ -79,11 +79,23 @@ class LeverageSubSampler(RandomSubSampler):
             group_leverage.index_add_(0, inverse_indices.to(self.device), row_leverage)
             local_leverage_per_config = group_leverage
         else:
+            # Represent each config by its ENERGY row (per enrow_mask), to match
+            # non-block Cook's and the documented semantics. Non-energy rows are
+            # masked to a large index so amin selects the energy row; a config
+            # with no energy row falls back to its first row.
             inv_dev = inverse_indices.device
-            perm = torch.arange(inverse_indices.size(0), device=inv_dev)
-            unique_first_indices = torch.empty(len(local_unique_vals), dtype=torch.long, device=inv_dev)
-            unique_first_indices.scatter_reduce_(0, inverse_indices, perm, reduce="amin", include_self=False)
-            local_leverage_per_config = row_leverage[unique_first_indices.to(self.device)]
+            n_rows = inverse_indices.size(0)
+            perm = torch.arange(n_rows, device=inv_dev)
+            enrow = self.enrow_mask_train.to(inv_dev)
+            en_perm = torch.where(enrow, perm, n_rows)
+            rep_idx = torch.empty(len(local_unique_vals), dtype=torch.long, device=inv_dev)
+            rep_idx.scatter_reduce_(0, inverse_indices, en_perm, reduce="amin", include_self=False)
+            no_energy = rep_idx >= n_rows
+            if no_energy.any():
+                first_idx = torch.empty(len(local_unique_vals), dtype=torch.long, device=inv_dev)
+                first_idx.scatter_reduce_(0, inverse_indices, perm, reduce="amin", include_self=False)
+                rep_idx = torch.where(no_energy, first_idx, rep_idx)
+            local_leverage_per_config = row_leverage[rep_idx.to(self.device)]
 
         # 4. Build per-config leverage vector matching global unique_config_idxs_train.
         if linalg.is_distributed():

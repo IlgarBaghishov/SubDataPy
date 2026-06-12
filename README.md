@@ -483,6 +483,8 @@ When `BaseData` receives `.npy` file paths for both `X` and `config_idxs` under 
 3. Train/test split uses the global config-id list so every rank agrees on which configs are test. Subsamplers use a global `unique_config_idxs_train` (built via `partition.build_global_config_ids`) so sampling with the same seed yields the same chosen configs across ranks.
 4. TSQR runs in `partitioned=True` mode: each rank QRs its local rows; rank 0 gathers per-rank R matrices and does a final QR; R is broadcast back to all ranks for downstream use. Only small tensors (p×p R, p×1 XTy, and the single winning config's rows per stepwise iteration) travel across NCCL.
 
+> **Requirement:** in partitioned mode the rows of each configuration must be **contiguous** in the `.npy` files (all rows of a config adjacent). Partitions are cut at config boundaries, so `scan_config_boundaries` raises a `ValueError` if configurations are interleaved. (In-memory / single-process mode tolerates non-contiguous configs.)
+
 ```python
 # Target: 2 nodes × 1 rank × 4 local GPUs = 8 GPUs, 2 CPU-RAM partitions.
 # Each rank sees all 4 local GPUs and round-robins chunks across them.

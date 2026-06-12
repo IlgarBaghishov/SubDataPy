@@ -182,6 +182,28 @@ def test_onestep_cooks_svd_qr_match_unordered_configs():
     assert sel("svd") == sel("qr")
 
 
+def test_leverage_nonblock_honors_enrow_mask():
+    """Non-block leverage must represent each config by its ENERGY row (per
+    enrow_mask), like non-block Cook's — not just its first row. So moving the
+    energy row within each config changes the per-config scores."""
+    rng = np.random.default_rng(0)
+    nc, rpc, p = 80, 6, 6
+    n = nc * rpc
+    X = np.hstack([np.ones((n, 1)), rng.standard_normal((n, p - 1))])
+    y = (X @ rng.standard_normal((p, 1))).reshape(-1)
+    cfg = np.repeat(np.arange(nc), rpc).astype(np.int64)
+    erm_first = np.zeros(n, bool); erm_first[::rpc] = True       # energy row first
+    erm_last = np.zeros(n, bool); erm_last[rpc - 1::rpc] = True  # energy row last
+
+    def lev(erm):
+        s = LeverageSubSampler(X, y=y, config_idxs=cfg, enrow_mask=erm, intercept=False,
+                               device="cpu", test_fraction=0.3, seed=41, factorization="qr")
+        s.create_subsample(0.5, seed=42)
+        return s.leverage_scores
+
+    assert not torch.allclose(lev(erm_first), lev(erm_last))
+
+
 def test_descending_cooks_rejects_explicit_qr_update(mini_dataset):
     """The QR update can only append rows, so explicit update_method='qr' with
     descending must raise rather than silently update in the wrong direction."""
