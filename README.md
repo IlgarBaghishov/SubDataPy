@@ -119,10 +119,10 @@ All fitting uses Weighted Least Squares (WLS). The weight vector `w` allows diff
 
 ### Data Flow
 
-1. Data loads to **CPU** (from `.npy` files, NumPy arrays, or DataFrames)
-2. An intercept column of ones is optionally prepended to X (`intercept=True`)
-3. Train/test split moves subsets to **GPU** (`device='cuda'`)
-4. All linear algebra runs on GPU in `torch.float64` (double precision)
+1. Data loads to **CPU** and stays there — the design matrix is never materialized on a single GPU.
+2. An intercept column of ones is optionally prepended to X (`intercept=True`).
+3. The train/test split records row indices; each step streams the needed rows of X to the device (`device='cuda'`) one chunk at a time (controlled by `n_chunks`).
+4. All linear algebra runs in `torch.float64` (double precision). Pass `dtype=torch.float32` to store **X** in float32 — this halves its host memory and transfer, with every chunk cast back up to float64 on the device so the factorizations stay full precision (`y`, `w`, and all factors remain float64). float32 storage is lossless if your descriptors are already float32; for ill-conditioned `X` where you need accurate coefficients, keep float64.
 
 ---
 
@@ -144,7 +144,7 @@ rs = RandomSubSampler(X=df_features, y=df_targets, ...)
 rs = RandomSubSampler(X=torch_tensor, y=torch_tensor, ...)
 ```
 
-All inputs are converted to `torch.float64` tensors internally.
+`y`, `w`, and (by default) `X` are stored as `torch.float64`; pass `dtype=torch.float32` to store `X` in float32 to save memory (see [Data Flow](#data-flow)).
 
 ---
 
